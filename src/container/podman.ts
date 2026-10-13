@@ -1,16 +1,10 @@
 import { randomUUID } from "node:crypto";
-import {
-  chmod,
-  lstat,
-  mkdir,
-  mkdtemp,
-  realpath,
-  rm,
-  writeFile,
-} from "node:fs/promises";
-import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { delimiter, isAbsolute, join, resolve } from "node:path";
 import { PiSeshError } from "../errors";
 import type { EffectiveSpec } from "../config/config";
+import { ensureOwnedPrivateDirectory, isPathWithin } from "../path-utils";
+import { readStreamBounded } from "../process-utils";
 
 const HOST_ENV_ALLOWLIST = [
   "PATH",
@@ -72,43 +66,6 @@ function fail(message: string, cause?: unknown): never {
   );
 }
 
-function pathWithin(parent: string, child: string): boolean {
-  const path = relative(parent, child);
-  return (
-    path === "" ||
-    (path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path))
-  );
-}
-
-async function readBounded(
-  stream: ReadableStream<Uint8Array>,
-  maxBytes: number,
-  onChunk?: (chunk: Uint8Array) => void,
-): Promise<string> {
-  const reader = stream.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      onChunk?.(value);
-      total += value.byteLength;
-      if (total > maxBytes) throw new Error("process output exceeded limit");
-      chunks.push(value);
-    }
-    const output = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-      output.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-    return new TextDecoder().decode(output);
-  } finally {
-    reader.releaseLock();
-  }
-}
-
 export const bunProcessRunner: ProcessRunner = async (argv, options) => {
   options.signal?.throwIfAborted();
   const proc = Bun.spawn({
@@ -127,16 +84,16 @@ export const bunProcessRunner: ProcessRunner = async (argv, options) => {
     if (options.stdio === "inherit")
       return { status: await proc.exited, stdout: "", stderr: "" };
     const [stdout, stderr, status] = await Promise.all([
-      readBounded(
+      readStreamBounded(
         proc.stdout as ReadableStream<Uint8Array>,
         MAX_OUTPUT_BYTES,
         options.onStdout,
-      ),
-      readBounded(
+      ).then((output) => new TextDecoder().decode(output)),
+      readStreamBounded(
         proc.stderr as ReadableStream<Uint8Array>,
         MAX_OUTPUT_BYTES,
         options.onStderr,
-      ),
+      ).then((output) => new TextDecoder().decode(output)),
       proc.exited,
     ]);
     return { status, stdout, stderr };
@@ -195,7 +152,7 @@ export async function buildHostEnvironment(
   for (const entry of rawPath.split(delimiter).filter(isAbsolute)) {
     try {
       const canonical = await realpath(entry);
-      if (!projectDir || !pathWithin(projectDir, canonical))
+      if (!projectDir || !isPathWithin(projectDir, canonical))
         safePath.push(canonical);
     } catch {
       // Ignore nonexistent executable directories.
@@ -383,16 +340,11 @@ async function privateBuildDirectory(
       "HOME or absolute XDG_DATA_HOME is required for temporary build credentials",
     );
   const root = join(resolve(dataHome), "pi-sesh", "build-tmp");
-  await mkdir(root, { recursive: true, mode: 0o700 });
-  const info = await lstat(root);
-  if (
-    info.isSymbolicLink() ||
-    !info.isDirectory() ||
-    info.uid !== process.getuid?.()
-  ) {
-    fail("Build temporary directory has unexpected ownership or type");
-  }
-  await chmod(root, 0o700);
+  await ensureOwnedPrivateDirectory(
+    root,
+    "Build temporary directory has unexpected ownership or type",
+    fail,
+  );
   return mkdtemp(join(root, "build-"));
 }
 

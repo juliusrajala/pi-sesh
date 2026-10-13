@@ -22,6 +22,7 @@ import {
   sep,
 } from "node:path";
 import { PiSeshError } from "../errors";
+import { ensureOwnedPrivateDirectory, isPathWithin } from "../path-utils";
 
 const MANIFEST_LIMIT = 1024 * 1024;
 const ENTRY_LIMIT = 32;
@@ -106,14 +107,6 @@ function currentUid(): number {
   if (value === undefined)
     fail("Host UID is unavailable; resource staging requires Linux");
   return value;
-}
-
-function within(parent: string, child: string): boolean {
-  const path = relative(parent, child);
-  return (
-    path === "" ||
-    (path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path))
-  );
 }
 
 function validateDestination(value: unknown): string {
@@ -271,9 +264,12 @@ export async function loadHandoffManifest(
   }
 }
 
+type SourceBudget = { files: number; entries: number; bytes: number };
+
 async function scanSource(
   sourcePath: string,
   secret: boolean,
+  budget: SourceBudget,
 ): Promise<SourceItem[]> {
   const items: SourceItem[] = [];
   const root = await lstat(sourcePath).catch((cause) =>
@@ -297,8 +293,18 @@ async function scanSource(
       fail(
         "Secret snapshot source entries must have no group/other permissions",
       );
-    if (info.isFile() && info.size > BYTE_LIMIT)
-      fail(`Handoff source exceeds the ${BYTE_LIMIT}-byte payload limit`);
+    const nextEntries = budget.entries + 1;
+    const nextFiles = budget.files + (info.isFile() ? 1 : 0);
+    const nextBytes = budget.bytes + (info.isFile() ? info.size : 0);
+    if (nextFiles > FILE_LIMIT)
+      fail(`Handoff exceeds the ${FILE_LIMIT}-file limit`);
+    if (nextEntries > FILE_LIMIT * 2)
+      fail(`Handoff exceeds the ${FILE_LIMIT * 2}-entry safety limit`);
+    if (nextBytes > BYTE_LIMIT)
+      fail(`Handoff exceeds the ${BYTE_LIMIT}-byte payload limit`);
+    budget.entries = nextEntries;
+    budget.files = nextFiles;
+    budget.bytes = nextBytes;
     items.push({
       relativePath,
       kind: info.isFile() ? "file" : "directory",
@@ -330,16 +336,14 @@ async function prepareManifestSources(
 ): Promise<PreparedResource[]> {
   const canonicalDirectory = await realpath(directory);
   const prepared: PreparedResource[] = [];
-  let files = 0;
-  let entries = 0;
-  let bytes = 0;
+  const budget: SourceBudget = { files: 0, entries: 0, bytes: 0 };
   for (const resource of manifest.resources) {
     if (resource.kind === "owned-directory") {
       prepared.push({ resource, sourceItems: [] });
       continue;
     }
     const candidate = resolve(canonicalDirectory, resource.source);
-    if (!within(canonicalDirectory, candidate))
+    if (!isPathWithin(canonicalDirectory, candidate))
       fail(`Handoff source for ${resource.id} escapes the manifest directory`);
     const pathParts = relative(canonicalDirectory, candidate)
       .split(sep)
@@ -356,23 +360,15 @@ async function prepareManifestSources(
     const sourcePath = await realpath(candidate).catch((cause) =>
       fail(`Handoff source for ${resource.id} is missing or unsafe`, cause),
     );
-    if (!within(canonicalDirectory, sourcePath))
+    if (!isPathWithin(canonicalDirectory, sourcePath))
       fail(
         `Handoff source for ${resource.id} resolves outside the manifest directory`,
       );
     const sourceItems = await scanSource(
       sourcePath,
       resource.lifetime === "secret",
+      budget,
     );
-    files += sourceItems.filter((item) => item.kind === "file").length;
-    entries += sourceItems.length;
-    bytes += sourceItems.reduce((total, item) => total + item.size, 0);
-    if (files > FILE_LIMIT)
-      fail(`Handoff exceeds the ${FILE_LIMIT}-file limit`);
-    if (entries > FILE_LIMIT * 2)
-      fail(`Handoff exceeds the ${FILE_LIMIT * 2}-entry safety limit`);
-    if (bytes > BYTE_LIMIT)
-      fail(`Handoff exceeds the ${BYTE_LIMIT}-byte payload limit`);
     prepared.push({ resource, sourcePath, sourceItems });
   }
   return prepared;
@@ -383,11 +379,11 @@ function resourceBase(stateRoot: string, sessionId: string): string {
 }
 
 async function privateDir(path: string): Promise<void> {
-  await mkdir(path, { recursive: true, mode: 0o700 });
-  const info = await lstat(path);
-  if (info.isSymbolicLink() || !info.isDirectory() || info.uid !== currentUid())
-    fail("Handoff staging directory has unexpected type or owner");
-  await chmod(path, 0o700);
+  await ensureOwnedPrivateDirectory(
+    path,
+    "Handoff staging directory has unexpected type or owner",
+    fail,
+  );
 }
 
 async function copyFile(

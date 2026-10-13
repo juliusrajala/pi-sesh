@@ -23,6 +23,7 @@ export { PiSeshError } from "../errors";
 import { stagedResourcePath } from "../handoff/handoff";
 import { defaultStateRoot } from "../workspace/workspace";
 import { writablePathBytes } from "./usage";
+import { isLiteralArgv } from "../argv";
 
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
 const DEFAULT_MAX_WRITABLE_BYTES = 4 * 1024 * 1024 * 1024;
@@ -398,15 +399,7 @@ function validateControlOptions(
 }
 
 function validateCommand(command: string[]): string[] {
-  if (
-    !Array.isArray(command) ||
-    command.length === 0 ||
-    command.length > 256 ||
-    command.some(
-      (part) =>
-        typeof part !== "string" || part.length === 0 || part.includes("\0"),
-    )
-  )
+  if (!isLiteralArgv(command, { maxArguments: 256 }))
     throw new Error("Command must be a non-empty literal argv array");
   return [...command];
 }

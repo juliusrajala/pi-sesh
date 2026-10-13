@@ -107,14 +107,12 @@ pi-sesh exec ci-tools --session-id <id> -- node --version
 pi-sesh exec ci-tools --session-id <id> --cwd /workspace -- git status --short
 ```
 
-Stop the environment before you remove it. Pass the immutable ID to protect against name reuse:
+Stop the environment before you remove it:
 
 ```sh
-pi-sesh stop ci-tools --session-id <id>
-pi-sesh remove ci-tools --session-id <id>
+pi-sesh stop ci-tools
+pi-sesh remove ci-tools
 ```
-
-Use `open --handoff /path/to/manifest.json` when the environment needs snapshots or owned resource directories. Handoff uses the same staging and cleanup rules as `start --handoff`.
 
 `exec` forwards stdin, stdout, and stderr. A timeout, cancellation, or transport failure stops the whole environment. Use `--timeout <seconds>` to set an execution deadline.
 
@@ -165,7 +163,7 @@ try {
   if (status !== 0) throw new Error(`Workload failed: ${status}`);
 } finally {
   const stop = Bun.spawn(
-    ["pi-sesh", "stop", session.name, "--session-id", session.id],
+    ["pi-sesh", "stop", session.name],
     {
       stdin: "ignore",
       stdout: "inherit",
@@ -176,7 +174,7 @@ try {
   if (stopStatus !== 0) throw new Error(`Could not stop ${session.name}`);
 
   const remove = Bun.spawn(
-    ["pi-sesh", "remove", session.name, "--session-id", session.id],
+    ["pi-sesh", "remove", session.name],
     {
       stdin: "ignore",
       stdout: "inherit",

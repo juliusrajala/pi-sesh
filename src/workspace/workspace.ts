@@ -10,9 +10,11 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
-import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { delimiter, isAbsolute, join, relative, resolve } from "node:path";
 import { PiSeshError } from "../errors";
 import type { WorkspaceMode } from "../config/config";
+import { ensureOwnedPrivateDirectory, isPathWithin } from "../path-utils";
+import { readStreamBounded } from "../process-utils";
 
 const MAX_COMMAND_OUTPUT = 16 * 1024 * 1024;
 const MAX_ATTRIBUTE_FILES = 512;
@@ -63,14 +65,6 @@ function fail(message: string, cause?: unknown): never {
   );
 }
 
-function within(parent: string, child: string): boolean {
-  const path = relative(parent, child);
-  return (
-    path === "" ||
-    (path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path))
-  );
-}
-
 async function canonicalDirectory(
   path: string,
   label: string,
@@ -92,7 +86,7 @@ async function trustedPath(projectDir: string): Promise<string> {
   for (const entry of rawPath.split(delimiter).filter(isAbsolute)) {
     try {
       const canonical = await realpath(entry);
-      if (!within(projectDir, canonical)) safe.push(canonical);
+      if (!isPathWithin(projectDir, canonical)) safe.push(canonical);
     } catch {
       // Nonexistent PATH entries cannot provide a trusted executable.
     }
@@ -115,23 +109,16 @@ async function collectProcess(
   label: string,
 ) {
   const collect = async (stream: ReadableStream<Uint8Array>) => {
-    const reader = stream.getReader();
-    const chunks: Uint8Array[] = [];
-    let size = 0;
     try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        size += value.byteLength;
-        if (size > MAX_COMMAND_OUTPUT) {
-          child.kill();
-          fail(`${label} output exceeded the safety limit`);
-        }
-        chunks.push(value);
-      }
-      return Buffer.concat(chunks).toString("utf8");
-    } finally {
-      reader.releaseLock();
+      const output = await readStreamBounded(stream, MAX_COMMAND_OUTPUT);
+      return Buffer.from(output).toString("utf8");
+    } catch (cause) {
+      if (
+        cause instanceof Error &&
+        cause.message === "process output exceeded limit"
+      )
+        fail(`${label} output exceeded the safety limit`, cause);
+      throw cause;
     }
   };
   try {
@@ -387,18 +374,12 @@ async function verifyAttributes(
 }
 
 async function ensurePrivateDirectory(path: string): Promise<string> {
-  await mkdir(path, { recursive: true, mode: 0o700 });
-  const info = await lstat(path);
-  if (
-    info.isSymbolicLink() ||
-    !info.isDirectory() ||
-    info.uid !== process.getuid?.()
-  ) {
-    fail(`Session state directory has unexpected ownership or type: ${path}`);
-  }
-  const canonical = await realpath(path);
-  await chmod(path, 0o700);
-  return canonical;
+  const directory = await ensureOwnedPrivateDirectory(
+    path,
+    `Session state directory has unexpected ownership or type: ${path}`,
+    fail,
+  );
+  return realpath(directory);
 }
 
 function ownerRecordPath(stateRoot: string, sessionId: string): string {
@@ -430,29 +411,17 @@ export async function prepareWorkspace(options: {
   return prepareClone({ ...options, projectDir });
 }
 
-async function prepareClone(options: {
-  projectDir: string;
-  sessionId: string;
-  stateRoot?: string;
-}): Promise<WorkspaceResult> {
-  const stateRoot = await ensurePrivateDirectory(
-    resolve(options.stateRoot ?? defaultStateRoot()),
-  );
-  const workspacesDir = await ensurePrivateDirectory(
-    join(stateRoot, "workspaces"),
-  );
-  await ensurePrivateDirectory(join(stateRoot, "workspace-records"));
-  const workspacePath = join(workspacesDir, options.sessionId);
-  const recordPath = ownerRecordPath(stateRoot, options.sessionId);
-  const token = randomUUID();
-  const git = await findGit(options.projectDir);
-  await verifyLocalConfig(git.path, git.envPath, options.projectDir);
-  await verifyAttributes(git.path, git.envPath, options.projectDir);
+async function validateCloneSource(
+  projectDir: string,
+  git: { path: string; envPath: string },
+): Promise<string> {
+  await verifyLocalConfig(git.path, git.envPath, projectDir);
+  await verifyAttributes(git.path, git.envPath, projectDir);
 
   const index = await runGit(
     git.path,
     git.envPath,
-    options.projectDir,
+    projectDir,
     ["ls-files", "--stage", "-z"],
     "Inspecting Git index",
   );
@@ -464,7 +433,7 @@ async function prepareClone(options: {
       );
   }
   try {
-    await lstat(join(options.projectDir, ".gitmodules"));
+    await lstat(join(projectDir, ".gitmodules"));
     fail(
       "Git submodules are unsupported in clone mode; use mount workspace mode",
     );
@@ -477,7 +446,7 @@ async function prepareClone(options: {
   const status = await runGit(
     git.path,
     git.envPath,
-    options.projectDir,
+    projectDir,
     [
       "status",
       "--porcelain=v1",
@@ -494,13 +463,33 @@ async function prepareClone(options: {
     await runGit(
       git.path,
       git.envPath,
-      options.projectDir,
+      projectDir,
       ["rev-parse", "--verify", "HEAD^{commit}"],
       "Reading Git HEAD",
     )
   ).trim();
   if (!/^[0-9a-f]{40}$/i.test(revision))
     fail("Git returned an unsupported HEAD object ID");
+  return revision;
+}
+
+async function prepareClone(options: {
+  projectDir: string;
+  sessionId: string;
+  stateRoot?: string;
+}): Promise<WorkspaceResult> {
+  const stateRoot = await ensurePrivateDirectory(
+    resolve(options.stateRoot ?? defaultStateRoot()),
+  );
+  const workspacesDir = await ensurePrivateDirectory(
+    join(stateRoot, "workspaces"),
+  );
+  await ensurePrivateDirectory(join(stateRoot, "workspace-records"));
+  const workspacePath = join(workspacesDir, options.sessionId);
+  const recordPath = ownerRecordPath(stateRoot, options.sessionId);
+  const token = randomUUID();
+  const git = await findGit(options.projectDir);
+  const revision = await validateCloneSource(options.projectDir, git);
 
   const templateDir = await ensurePrivateDirectory(
     join(stateRoot, "empty-git-template"),

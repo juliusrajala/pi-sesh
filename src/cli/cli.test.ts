@@ -382,6 +382,21 @@ test("build forwards validated image, recipe, context, and pull option", async (
   expect(result.stdout).toContain("Built localhost/test:local");
 });
 
+test("build-default builds the shared image and forwards pull approval", async () => {
+  const result = await execute(["build-default", "--pull"], {
+    buildDefaultImage: async (options) => {
+      expect(options?.pullMissingBases).toBe(true);
+      return {
+        tag: "localhost/pi-sesh-default:1",
+        imageId: "a".repeat(64),
+        podmanVersion: "6.1.1",
+      };
+    },
+  });
+  expect(result.code).toBe(0);
+  expect(result.stdout).toContain("Built localhost/pi-sesh-default:1");
+});
+
 test("start accepts literal argv and an explicit handoff", async () => {
   const project = await fixture();
   const result = await execute(
@@ -535,6 +550,7 @@ test("preset, project, and CLI literal environments use safe precedence", async 
     expect(options.spec.environment).toEqual({
       NODE_ENV: "cli",
       PROJECT_PROFILE: "literal",
+      TMPDIR: "/workspace",
       USER_PROFILE: "$HOME",
     });
     expect(options.spec.workspace).toBe("clone");
@@ -554,6 +570,8 @@ test("preset, project, and CLI literal environments use safe precedence", async 
       "pasta",
       "--env",
       "NODE_ENV=cli",
+      "--env",
+      "TMPDIR=/workspace",
     ],
     dependencies,
   );
@@ -612,10 +630,8 @@ test("open returns an isolated offline environment descriptor", async () => {
     command: ["untrusted"],
   });
   const id = "88888888-8888-4888-8888-888888888888";
-  let handoff: string | undefined;
   const dependencies: CliDependencies = {
     startSession: async (options) => {
-      handoff = options.handoffManifestPath;
       expect(options.spec.workspace).toBe("clone");
       expect(options.spec.network).toBe("none");
       expect(options.spec.command?.[0]).toBe("/bin/sh");
@@ -650,39 +666,6 @@ test("open returns an isolated offline environment descriptor", async () => {
     dependencies,
   );
   expect(JSON.parse(result.stdout).workspacePath).toBe("/owned/clone");
-  expect(handoff).toBeUndefined();
-  const staged = await execute(
-    ["open", project, "--name", "dev", "--handoff", "/private/handoff.json"],
-    dependencies,
-  );
-  expect(staged.code).toBe(0);
-  expect(handoff).toBe("/private/handoff.json");
-});
-
-test("stop and remove accept an optional immutable session identity", async () => {
-  for (const action of ["stop", "remove"]) {
-    let identity: string | undefined;
-    const dependencies: CliDependencies = {
-      stopSession: async (options) => {
-        identity = options.sessionId;
-        return { state: "exited" };
-      },
-      removeSession: async (options) => {
-        identity = options.sessionId;
-      },
-    };
-    expect(
-      (
-        await execute(
-          [action, "dev", "--session-id", "expected-id"],
-          dependencies,
-        )
-      ).code,
-    ).toBe(0);
-    expect(identity).toBe("expected-id");
-    expect((await execute([action, "dev"], dependencies)).code).toBe(0);
-    expect(identity).toBeUndefined();
-  }
 });
 
 test("exec forwards stdin and literal argv with immutable identity", async () => {

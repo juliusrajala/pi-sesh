@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { resolveEffectiveSpec } from "./config";
+import { DEFAULT_IMAGE, resolveEffectiveSpec } from "./config";
 
 const temporaryDirectories: string[] = [];
 
@@ -226,6 +226,32 @@ test("project preset fields cannot select host preparation or resources", async 
       }),
     ).rejects.toThrow("Unsupported configuration field");
   }
+});
+
+test("an absent project image uses the shared default image", async () => {
+  const { project } = await fixture();
+  const spec = await resolveEffectiveSpec({
+    projectDir: project,
+    purpose: "start",
+    overrides: { command: ["tool", "--literal"] },
+  });
+  expect(spec.image).toBe(DEFAULT_IMAGE);
+  expect(spec.command).toEqual(["tool", "--literal"]);
+});
+
+test("a user preset image takes precedence over the shared default", async () => {
+  const { project } = await fixture();
+  const spec = await resolveEffectiveSpec({
+    projectDir: project,
+    purpose: "start",
+    presetDefaults: {
+      image: "localhost/user-agent:local",
+      workspace: "mount",
+      network: "none",
+    },
+    overrides: { command: ["agent"] },
+  });
+  expect(spec.image).toBe("localhost/user-agent:local");
 });
 
 test("an absent default config works with explicit image and command", async () => {

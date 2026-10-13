@@ -1,10 +1,14 @@
 import { Buffer } from "node:buffer";
 import { lstat, realpath, stat } from "node:fs/promises";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { PiSeshError } from "../errors";
+import { isPathWithin } from "../path-utils";
+import { isLiteralArgv } from "../argv";
 
 export type WorkspaceMode = "mount" | "clone";
 export type NetworkMode = "none" | "pasta";
+
+export const DEFAULT_IMAGE = "localhost/pi-sesh-default:1";
 
 export interface BuildConfig {
   context: string;
@@ -65,7 +69,7 @@ const BUILD_KEYS = new Set(["context", "file"]);
 const IMAGE_REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._/:@+-]{0,254}$/;
 const ENVIRONMENT_NAME = /^[A-Z_][A-Z0-9_]{0,63}$/;
 const RESERVED_ENVIRONMENT_NAME =
-  /^(?:HOME|PATH|PWD|OLDPWD|TMPDIR|TERM|COLORTERM|LANG|LC_ALL|NODE_OPTIONS|BASH_ENV|ENV|SHELLOPTS|NODE_TLS_REJECT_UNAUTHORIZED|NODE_EXTRA_CA_CERTS|SSL_CERT_(?:FILE|DIR)|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|XDG_.*|PI_.*|LD_.*|OPENAI_.*|ANTHROPIC_.*|GOOGLE_GENERATIVE_AI_.*|AZURE_OPENAI_.*|AWS_ENDPOINT_URL.*|GIT_CONFIG_.*|GIT_ASKPASS|GIT_SSH(?:_COMMAND)?|GIT_EXEC_PATH|GIT_EXTERNAL_DIFF|GIT_PAGER|SSH_ASKPASS|SSH_AUTH_SOCK)$/;
+  /^(?:HOME|PATH|PWD|OLDPWD|TERM|COLORTERM|LANG|LC_ALL|NODE_OPTIONS|BASH_ENV|ENV|SHELLOPTS|NODE_TLS_REJECT_UNAUTHORIZED|NODE_EXTRA_CA_CERTS|SSL_CERT_(?:FILE|DIR)|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|XDG_.*|PI_.*|LD_.*|OPENAI_.*|ANTHROPIC_.*|GOOGLE_GENERATIVE_AI_.*|AZURE_OPENAI_.*|AWS_ENDPOINT_URL.*|GIT_CONFIG_.*|GIT_ASKPASS|GIT_SSH(?:_COMMAND)?|GIT_EXEC_PATH|GIT_EXTERNAL_DIFF|GIT_PAGER|SSH_ASKPASS|SSH_AUTH_SOCK)$/;
 const SECRET_ENVIRONMENT_NAME =
   /(?:^|_)(?:API_KEY|ACCESS_KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH|DATABASE_URL)(?:_|$)/i;
 const MAX_ENVIRONMENT_ENTRIES = 64;
@@ -196,14 +200,7 @@ function validateConfig(value: unknown): ProjectConfig {
 
   let command: string[] | undefined;
   if (input.command !== undefined) {
-    if (
-      !Array.isArray(input.command) ||
-      input.command.length === 0 ||
-      input.command.some(
-        (part) =>
-          typeof part !== "string" || part.length === 0 || part.includes("\0"),
-      )
-    ) {
+    if (!isLiteralArgv(input.command)) {
       fail("command must be a non-empty array of non-empty strings");
     }
     command = [...input.command];
@@ -220,14 +217,6 @@ function validateConfig(value: unknown): ProjectConfig {
     ...(network === undefined ? {} : { network }),
     ...(environment === undefined ? {} : { environment }),
   };
-}
-
-function isWithin(parent: string, child: string): boolean {
-  const path = relative(parent, child);
-  return (
-    path === "" ||
-    (path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path))
-  );
 }
 
 async function canonicalExistingPath(
@@ -288,7 +277,7 @@ export async function loadConfig(
   if (!fileInfo.isFile())
     fail(`Config must be a regular file: ${requestedPath}`);
   const configFile = await canonicalExistingPath(requestedPath, "Config file");
-  if (!explicitConfig && !isWithin(projectDir, configFile)) {
+  if (!explicitConfig && !isPathWithin(projectDir, configFile)) {
     fail(
       "Default pi-sesh.json symlink must resolve inside the selected project",
     );
@@ -318,7 +307,7 @@ async function resolveContainedPath(
   if (kind === "directory" ? !info.isDirectory() : !info.isFile()) {
     fail(`${label} must be a ${kind}: ${candidate}`);
   }
-  if (!isWithin(projectDir, candidate))
+  if (!isPathWithin(projectDir, candidate))
     fail(`${label} must stay inside the selected project`);
   return candidate;
 }
@@ -345,7 +334,10 @@ export async function resolveEffectiveSpec(options: {
   const config = loaded.config ?? { version: 1 as const };
   const overrides = options.overrides ?? {};
   const image =
-    overrides.image ?? config.image ?? options.presetDefaults?.image;
+    overrides.image ??
+    config.image ??
+    options.presetDefaults?.image ??
+    (options.purpose === "start" ? DEFAULT_IMAGE : undefined);
   if (!image)
     fail("Specify an image with --image, pi-sesh.json, or the user preset");
   validateImageReference(image);
@@ -382,7 +374,7 @@ export async function resolveEffectiveSpec(options: {
       "Build recipe",
       "file",
     );
-    if (!isWithin(context, file))
+    if (!isPathWithin(context, file))
       fail("Build recipe must be inside the build context");
     build = { context, file };
   }
@@ -393,13 +385,7 @@ export async function resolveEffectiveSpec(options: {
   if (options.purpose === "start" && (!command || command.length === 0)) {
     fail("Specify a command after -- or in pi-sesh.json");
   }
-  if (
-    command &&
-    command.some(
-      (part) =>
-        typeof part !== "string" || part.length === 0 || part.includes("\0"),
-    )
-  ) {
+  if (command && !isLiteralArgv(command)) {
     fail("Command argv must contain non-empty strings without NUL bytes");
   }
 

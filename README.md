@@ -14,7 +14,7 @@ On Linux, you need:
 - cgroup v2 with memory and PID controllers available to Podman.
 - Host Git, if you use a clone workspace.
 - The pasta network backend, if you build an image or enable container networking.
-- A local Linux x86-64 image with the tools needed by your command.
+- A local Linux x86-64 image with the tools needed by your command. If no image is configured, pi-sesh uses the shared `localhost/pi-sesh-default:1` image.
 
 Use `podman info` to check the engine. Pi-sesh also checks these requirements before a build or session start.
 
@@ -46,6 +46,14 @@ The `export` command changes only the current shell. Use your normal shell confi
 
 Set up your shared user agent preset once. Reuse it across projects. Pi-sesh does not install an agent in each project.
 
+If a project has no image setting, pi-sesh uses the shared default image `localhost/pi-sesh-default:1`. Build it once with Git and Bun:
+
+```sh
+pi-sesh build-default --pull
+```
+
+This explicit build can download the missing base image and Git package. Launch does not build images or download them. The default image supplies Bun and Git. Use a project image when the project needs other tools.
+
 In a project with an existing `Containerfile` or `Dockerfile`, run these two setup commands:
 
 ```sh
@@ -63,7 +71,7 @@ pi-sesh pi
 
 If the project has no recipe, select an existing local development image with `pi-sesh init --image localhost/project:dev`. No build is needed in that case. Pi-sesh does not guess the project's tools or write a replacement recipe.
 
-The build uses cached base images by default. Use `pi-sesh build . --pull` only if you approve downloads. Build steps can use the network.
+The build uses cached base images by default. Use `pi-sesh build . --pull` only if you approve downloads. Build steps can use the network. Image selection uses this order: CLI option, project config, user preset, then the shared default image. Use `pi-sesh build-default --pull` to build or update the shared default image.
 
 `pi-sesh <preset>` works for any trusted user preset. It is the short form of `pi-sesh launch <preset>`. Pass agent options after `--`:
 
@@ -255,7 +263,7 @@ A preset without `image` allows the project to select the image. **That image ca
 
 Project config cannot select a preset, host preparation command, runtime mount, or handoff resource.
 
-Environment values are literal, bounded, single-line strings. Pi-sesh rejects reserved variables and credential-like names. For example, you cannot set `HOME`, `PATH`, `HTTP_PROXY`, `OPENAI_API_KEY`, or `SSH_AUTH_SOCK`. Use handoff resources for credentials, not `--env`. Pi-sesh does not copy the host environment into the container. Environment values defined in the image can still apply.
+Environment values are literal, bounded, single-line strings. Pi-sesh rejects reserved variables and credential-like names. For example, you cannot set `HOME`, `PATH`, `HTTP_PROXY`, `OPENAI_API_KEY`, or `SSH_AUTH_SOCK`. `TMPDIR` may be set explicitly when a tool needs temporary files on an executable filesystem; for example, `--env TMPDIR=/workspace` can work around tools that load native libraries from temporary storage. `/tmp` and the default home tmpfs remain `noexec`. Use handoff resources for credentials, not `--env`. Pi-sesh does not copy the host environment into the container. Environment values defined in the image can still apply.
 
 ### Program files and host preparation
 
@@ -309,7 +317,7 @@ Files written only to the default `/home/session` or `/tmp` are temporary. Use t
 
 ## Session resources
 
-Use `start --handoff /path/to/manifest.json` or `open --handoff /path/to/manifest.json` for explicit resources. A preset can supply them through its trusted preparation command. See [`examples/handoff/`](examples/handoff/) for an example.
+Use `start --handoff /path/to/manifest.json` for explicit resources. A preset can supply them through its trusted preparation command. See [`examples/handoff/`](examples/handoff/) for an example.
 
 A handoff manifest describes copied input files and session-owned output directories:
 
@@ -364,7 +372,7 @@ Use `--detach --tty` to start a terminal session for later attachment. Press `Ct
 
 SIGINT or SIGTERM sent to an attached `launch` stops and verifies the container. A caught attached launch transport failure also stops it. Results remain after a verified stop. A launcher crash or `SIGKILL` can leave the workload running. Inspect it and use `stop` if needed. A terminal `Ctrl-C` can instead be handled by the workload as input.
 
-`stop` allows 10 seconds for shutdown before Podman can force it. A paused container must be resumed before stop. Stop a running session before removal. Automation can pass `--session-id <id>` to `stop` and `remove` to reject a session that reuses the name.
+`stop` allows 10 seconds for shutdown before Podman can force it. A paused container must be resumed before stop. Stop a running session before removal.
 
 `remove` verifies that the owned container is absent before it deletes a clone, resource, or session record. Engine errors and ownership mismatches block cleanup. Do not bypass these checks by deleting state directories manually.
 

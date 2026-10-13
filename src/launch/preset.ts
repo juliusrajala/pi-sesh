@@ -2,8 +2,10 @@ import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, lstat, mkdtemp, open, realpath, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { PiSeshError } from "../errors";
+import { isPathWithin } from "../path-utils";
+import { isLiteralArgv } from "../argv";
 import { validateRuntimeMounts, type RuntimeMount } from "./runtime";
 import {
   validateContainerEnvironment,
@@ -18,6 +20,7 @@ const RESERVED_NAMES = new Set([
   "stop-all",
   "setup-prompt",
   "build",
+  "build-default",
   "open",
   "exec",
   "launch",
@@ -62,16 +65,7 @@ function record(value: unknown, label: string): Record<string, unknown> {
 
 function stringArgv(value: unknown, label: string, maximum = 128): string[] {
   if (
-    !Array.isArray(value) ||
-    value.length === 0 ||
-    value.length > maximum ||
-    value.some(
-      (part) =>
-        typeof part !== "string" ||
-        part.length === 0 ||
-        part.length > 8192 ||
-        part.includes("\0"),
-    )
+    !isLiteralArgv(value, { maxArguments: maximum, maxArgumentLength: 8192 })
   ) {
     return fail(`${label} must be a non-empty array of literal strings`);
   }
@@ -237,14 +231,6 @@ export async function loadLaunchPreset(
   return validatePreset(preset, name);
 }
 
-function within(parent: string, child: string): boolean {
-  const path = relative(parent, child);
-  return (
-    path === "" ||
-    (path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path))
-  );
-}
-
 export function generatedSessionName(): string {
   return `pi-${randomUUID().replaceAll("-", "")}`;
 }
@@ -297,7 +283,7 @@ export async function preparePresetHandoff(
       info.uid !== process.getuid?.() ||
       (info.mode & 0o077) !== 0 ||
       canonicalManifest !== manifestPath ||
-      !within(canonicalDirectory, canonicalManifest)
+      !isPathWithin(canonicalDirectory, canonicalManifest)
     ) {
       fail(
         "Preset handoff manifest must be private and inside its prepare directory",
@@ -321,7 +307,7 @@ export async function preparePresetHandoff(
         fail("Prepared runtime manifest requires version 1 and mounts");
       runtimeMounts = validateRuntimeMounts(value.mounts);
       for (const mount of runtimeMounts) {
-        if (within(canonicalDirectory, await realpath(mount.source)))
+        if (isPathWithin(canonicalDirectory, await realpath(mount.source)))
           fail(
             "Runtime sources must stay outside the temporary preparation directory",
           );

@@ -1,9 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { Buffer } from "node:buffer";
 import {
-  chmod,
   lstat,
-  mkdir,
   readdir,
   readFile,
   rename,
@@ -12,6 +10,7 @@ import {
 } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import {
+  DEFAULT_IMAGE,
   validateContainerEnvironment,
   type EffectiveSpec,
 } from "../config/config";
@@ -24,6 +23,7 @@ import {
   type StagedResourceRecord,
 } from "../handoff/handoff";
 import { PodmanClient, type CommandResult } from "./podman";
+import { ensureOwnedPrivateDirectory } from "../path-utils";
 import { runtimeMountArgs, type RuntimeMount } from "../launch/runtime";
 import {
   defaultStateRoot,
@@ -106,17 +106,11 @@ function namePath(stateRoot: string, name: string): string {
 }
 
 async function privateDirectory(path: string): Promise<string> {
-  await mkdir(path, { recursive: true, mode: 0o700 });
-  const info = await lstat(path);
-  if (
-    info.isSymbolicLink() ||
-    !info.isDirectory() ||
-    info.uid !== process.getuid?.()
-  ) {
-    fail(`Session state directory has unexpected type or owner: ${path}`);
-  }
-  await chmod(path, 0o700);
-  return resolve(path);
+  return ensureOwnedPrivateDirectory(
+    path,
+    `Session state directory has unexpected type or owner: ${path}`,
+    fail,
+  );
 }
 
 async function prepareStateRoot(
@@ -306,17 +300,25 @@ async function recordByName(
   return record;
 }
 
-function parseContainerInspect(output: string): any {
-  let parsed: any;
+type ContainerInspect = Record<string, unknown>;
+
+function objectValue(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function parseContainerInspect(output: string): ContainerInspect {
+  let parsed: unknown;
   try {
     parsed = JSON.parse(output);
   } catch (cause) {
     fail("Podman returned invalid container inspection data", cause);
   }
   const item = Array.isArray(parsed) ? parsed[0] : parsed;
-  if (!item || typeof item !== "object")
-    fail("Podman returned empty container inspection data");
-  return item;
+  const result = objectValue(item);
+  if (!result) fail("Podman returned empty container inspection data");
+  return result;
 }
 
 export function buildContainerCreateArgs(options: {
@@ -442,19 +444,20 @@ async function inspectContainer(
     record.containerId,
   ]);
   const item = parseContainerInspect(result.stdout);
+  const stateInfo = objectValue(item.State);
+  const config = objectValue(item.Config);
+  const labels = objectValue(config?.Labels ?? item.Labels);
   if (
     typeof item.Id !== "string" ||
     !/^[0-9a-f]{64}$/i.test(item.Id) ||
-    !item.State ||
-    typeof item.State.Status !== "string" ||
-    typeof item.State.ExitCode !== "number" ||
-    !Number.isInteger(item.State.ExitCode)
+    !stateInfo ||
+    typeof stateInfo.Status !== "string" ||
+    typeof stateInfo.ExitCode !== "number" ||
+    !Number.isInteger(stateInfo.ExitCode)
   ) {
     fail("Podman returned incomplete container inspection data");
   }
-  const labels = item.Config?.Labels ?? item.Labels ?? {};
-  if (!labels || typeof labels !== "object")
-    fail("Podman returned invalid container labels");
+  if (!labels) fail("Podman returned invalid container labels");
   if (
     item.Id !== record.containerId ||
     labels[OWNER_LABEL] !== "pi-sesh" ||
@@ -464,7 +467,7 @@ async function inspectContainer(
       "Refusing to operate on a container not owned by this pi-sesh session",
     );
   }
-  const rawState = String(item.State?.Status ?? "").toLowerCase();
+  const rawState = stateInfo.Status.toLowerCase();
   const states: Record<string, ContainerStatus["state"]> = {
     running: "running",
     exited: "exited",
@@ -476,17 +479,22 @@ async function inspectContainer(
   const state = states[rawState];
   if (!state)
     fail(`Unsupported Podman container state: ${rawState || "unknown"}`);
-  const exitCode = Number(item.State?.ExitCode);
+  const exitCode = stateInfo.ExitCode;
   return {
     status:
       state === "running" || state === "created" || state === "paused"
         ? { state }
         : { state, exitCode },
-    selinux: Boolean(
-      item.HostConfig?.SecurityOpt?.some?.((value: string) =>
-        value.includes("label"),
-      ),
-    ),
+    selinux: (() => {
+      const hostConfig = objectValue(item.HostConfig);
+      const securityOpt = hostConfig?.SecurityOpt;
+      return (
+        Array.isArray(securityOpt) &&
+        securityOpt.some(
+          (value) => typeof value === "string" && value.includes("label"),
+        )
+      );
+    })(),
   };
 }
 
@@ -534,6 +542,17 @@ async function cleanSessionSecrets(
   await cleanHandoffResources(stateRoot, record, "secret");
 }
 
+async function inspectAndCleanSession(
+  client: PodmanClient,
+  stateRoot: string,
+  record: SessionRecord,
+): Promise<{ record: SessionRecord; status: ContainerStatus }> {
+  const inspected = await inspectContainer(client, record);
+  if (isStoppedOrMissing(inspected.status.state))
+    await cleanSessionSecrets(stateRoot, record);
+  return { record, status: inspected.status };
+}
+
 async function removeSessionRecord(
   stateRoot: string,
   record: SessionRecord,
@@ -572,8 +591,12 @@ export async function startSession(options: {
     (await PodmanClient.create({ projectDir: options.spec.projectDir }));
   const host = await client.preflight(options.spec.network);
   if (!(await client.imageExists(options.spec.image))) {
+    const remedy =
+      options.spec.image === DEFAULT_IMAGE
+        ? 'run "pi-sesh build-default" (use --pull if the base image is missing)'
+        : "build or select an image";
     fail(
-      `Image ${options.spec.image} is not present locally; build or select an image before starting`,
+      `Image ${options.spec.image} is not present locally; ${remedy} before starting`,
     );
   }
   const imageId = await client.imageId(options.spec.image);
@@ -776,68 +799,98 @@ export async function startSession(options: {
         `Launch interrupted; stopped session ${options.name} and its results remain available`,
         error,
       );
-    let cleanupProblem: unknown;
-    if (containerCreated) {
-      const target =
-        record &&
-        /^[0-9a-f]{64}$/i.test(record.containerId) &&
-        record.containerId !== "0".repeat(64)
-          ? record.containerId
-          : containerName;
-      try {
-        await client.invoke(["container", "rm", "--force", target]);
-        const exists = await client.invoke(["container", "exists", target]);
-        if (exists.status !== 1) {
-          cleanupProblem = new Error(
-            `container removal could not be verified (exists exit ${exists.status})`,
-          );
-        }
-      } catch (cause) {
-        cleanupProblem = cause;
-      }
-    }
-    const mayCleanResources = !containerCreated || !cleanupProblem;
-    if (handoffSetup) {
-      try {
-        await handoffSetup.cleanup();
-        handoffSetup = undefined;
-      } catch (cause) {
-        cleanupProblem ??= cause;
-      }
-    }
-    if (mayCleanResources && record?.resources?.length) {
-      try {
-        await cleanHandoffResources(stateRoot, record, "all");
-      } catch (cause) {
-        cleanupProblem ??= cause;
-      }
-    }
-    if (mayCleanResources && workspace?.mode === "clone") {
-      try {
-        await removeOwnedClone({
-          stateRoot,
-          sessionId: id,
-          expectedWorkspacePath: workspace.path,
-          containerAbsent: true,
-        });
-      } catch (cause) {
-        cleanupProblem ??= cause;
-      }
-    }
-    if (cleanupProblem) {
-      if (record) await writeRecord(stateRoot, record).catch(() => {});
-      throw new PiSeshError(
-        "SESSION",
-        `Startup failed (${error instanceof Error ? error.message : String(error)}) and owned resources could not be fully cleaned (${cleanupProblem instanceof Error ? cleanupProblem.message : String(cleanupProblem)}); session ${options.name} remains reserved for recovery`,
-        { cause: error },
-      );
-    }
+    await rollbackFailedStart({
+      error,
+      client,
+      containerCreated,
+      record,
+      containerName,
+      handoffSetup,
+      stateRoot,
+      workspace,
+      sessionId: id,
+      name: options.name,
+    });
     await rm(sessionPath(stateRoot, id), { force: true }).catch(() => {});
     await releaseName(stateRoot, options.name, id).catch(() => {});
     if (error instanceof PiSeshError) throw error;
     fail(
       `Unable to start session: ${error instanceof Error ? error.message : String(error)}`,
       error,
+    );
+  }
+}
+
+async function rollbackFailedStart(options: {
+  error: unknown;
+  client: PodmanClient;
+  containerCreated: boolean;
+  record?: SessionRecord;
+  containerName: string;
+  handoffSetup?: { cleanup: () => Promise<void> };
+  stateRoot: string;
+  workspace?: WorkspaceResult;
+  sessionId: string;
+  name: string;
+}): Promise<void> {
+  let cleanupProblem: unknown;
+  if (options.containerCreated) {
+    const target =
+      options.record &&
+      /^[0-9a-f]{64}$/i.test(options.record.containerId) &&
+      options.record.containerId !== "0".repeat(64)
+        ? options.record.containerId
+        : options.containerName;
+    try {
+      await options.client.invoke(["container", "rm", "--force", target]);
+      const exists = await options.client.invoke([
+        "container",
+        "exists",
+        target,
+      ]);
+      if (exists.status !== 1) {
+        cleanupProblem = new Error(
+          `container removal could not be verified (exists exit ${exists.status})`,
+        );
+      }
+    } catch (cause) {
+      cleanupProblem = cause;
+    }
+  }
+  const mayCleanResources = !options.containerCreated || !cleanupProblem;
+  if (options.handoffSetup) {
+    try {
+      await options.handoffSetup.cleanup();
+    } catch (cause) {
+      cleanupProblem ??= cause;
+    }
+  }
+  if (mayCleanResources && options.record?.resources?.length) {
+    try {
+      await cleanHandoffResources(options.stateRoot, options.record, "all");
+    } catch (cause) {
+      cleanupProblem ??= cause;
+    }
+  }
+  if (mayCleanResources && options.workspace?.mode === "clone") {
+    try {
+      await removeOwnedClone({
+        stateRoot: options.stateRoot,
+        sessionId: options.sessionId,
+        expectedWorkspacePath: options.workspace.path,
+        containerAbsent: true,
+      });
+    } catch (cause) {
+      cleanupProblem ??= cause;
+    }
+  }
+  if (cleanupProblem) {
+    if (options.record)
+      await writeRecord(options.stateRoot, options.record).catch(() => {});
+    throw new PiSeshError(
+      "SESSION",
+      `Startup failed (${options.error instanceof Error ? options.error.message : String(options.error)}) and owned resources could not be fully cleaned (${cleanupProblem instanceof Error ? cleanupProblem.message : String(cleanupProblem)}); session ${options.name} remains reserved for recovery`,
+      { cause: options.error },
     );
   }
 }
@@ -864,10 +917,7 @@ export async function getSessionStatusById(options: {
 }): Promise<{ record: SessionRecord; status: ContainerStatus }> {
   const { stateRoot, client } = await findStateRoot(options);
   const record = await readRecord(stateRoot, options.id);
-  const inspected = await inspectContainer(client, record);
-  if (isStoppedOrMissing(inspected.status.state))
-    await cleanSessionSecrets(stateRoot, record);
-  return { record, status: inspected.status };
+  return inspectAndCleanSession(client, stateRoot, record);
 }
 
 export async function getSessionStatus(options: {
@@ -877,10 +927,7 @@ export async function getSessionStatus(options: {
 }): Promise<{ record: SessionRecord; status: ContainerStatus }> {
   const { stateRoot, client } = await findStateRoot(options);
   const record = await recordByName(stateRoot, options.name);
-  const inspected = await inspectContainer(client, record);
-  if (isStoppedOrMissing(inspected.status.state))
-    await cleanSessionSecrets(stateRoot, record);
-  return { record, status: inspected.status };
+  return inspectAndCleanSession(client, stateRoot, record);
 }
 
 export async function listSessions(options: {
@@ -894,10 +941,7 @@ export async function listSessions(options: {
   for (const entry of entries.filter((name) => name.endsWith(".json"))) {
     const id = entry.slice(0, -5);
     const record = await readRecord(stateRoot, id);
-    const inspected = await inspectContainer(client, record);
-    if (isStoppedOrMissing(inspected.status.state))
-      await cleanSessionSecrets(stateRoot, record);
-    sessions.push({ record, status: inspected.status });
+    sessions.push(await inspectAndCleanSession(client, stateRoot, record));
   }
   return sessions;
 }
@@ -1100,6 +1144,24 @@ export async function attachSession(options: {
   return result.status;
 }
 
+async function readLogsForRecord(
+  client: PodmanClient,
+  stateRoot: string,
+  record: SessionRecord,
+  stdio: "inherit" | "pipe",
+): Promise<CommandResult> {
+  const inspected = await inspectContainer(client, record);
+  if (inspected.status.state === "missing")
+    fail(`Container for session ${record.name} is missing`);
+  const result = await client.invoke(
+    ["container", "logs", record.containerId],
+    { stdio },
+  );
+  if (isStoppedOrMissing(inspected.status.state))
+    await cleanSessionSecrets(stateRoot, record);
+  return result;
+}
+
 export async function readSessionLogsById(options: {
   id: string;
   stateRoot?: string;
@@ -1107,16 +1169,7 @@ export async function readSessionLogsById(options: {
 }): Promise<CommandResult> {
   const { stateRoot, client } = await findStateRoot(options);
   const record = await readRecord(stateRoot, options.id);
-  const inspected = await inspectContainer(client, record);
-  if (inspected.status.state === "missing")
-    fail(`Container for session ${record.name} is missing`);
-  const result = await client.invoke(
-    ["container", "logs", record.containerId],
-    { stdio: "pipe" },
-  );
-  if (isStoppedOrMissing(inspected.status.state))
-    await cleanSessionSecrets(stateRoot, record);
-  return result;
+  return readLogsForRecord(client, stateRoot, record, "pipe");
 }
 
 export async function showSessionLogs(options: {
@@ -1126,16 +1179,7 @@ export async function showSessionLogs(options: {
 }): Promise<CommandResult> {
   const { stateRoot, client } = await findStateRoot(options);
   const record = await recordByName(stateRoot, options.name);
-  const status = await inspectContainer(client, record);
-  if (status.status.state === "missing")
-    fail(`Container for session ${record.name} is missing`);
-  const result = await client.invoke(
-    ["container", "logs", record.containerId],
-    { stdio: "inherit" },
-  );
-  if (isStoppedOrMissing(status.status.state))
-    await cleanSessionSecrets(stateRoot, record);
-  return result;
+  return readLogsForRecord(client, stateRoot, record, "inherit");
 }
 
 export async function stopSession(options: {

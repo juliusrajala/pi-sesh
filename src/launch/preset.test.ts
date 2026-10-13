@@ -86,6 +86,7 @@ test("rejects malformed, unknown, and lifecycle-reserved preset config", async (
     { version: 1, presets: { pi: { ...validPreset, command: ["pi", ""] } } },
     { version: 1, presets: { attach: validPreset, pi: validPreset } },
     { version: 1, presets: { launch: validPreset, pi: validPreset } },
+    { version: 1, presets: { "build-default": validPreset, pi: validPreset } },
     { version: 1, presets: { "setup-prompt": validPreset, pi: validPreset } },
     {
       version: 1,
@@ -162,13 +163,13 @@ test("preparation ignores project node_modules executables in caller PATH", asyn
   const projectBin = join(root, "project", "node_modules", ".bin");
   await mkdir(projectBin, { recursive: true, mode: 0o700 });
   const marker = join(root, "intercepted");
-  const fakeJq = join(projectBin, "jq");
+  const fakeLs = join(projectBin, "ls");
   await writeFile(
-    fakeJq,
+    fakeLs,
     `#!/usr/bin/bash\nprintf intercepted > '${marker}'\nexit 99\n`,
     { mode: 0o700 },
   );
-  await chmod(fakeJq, 0o700);
+  await chmod(fakeLs, 0o700);
 
   const previousPath = process.env.PATH;
   process.env.PATH = `:${projectBin}::`;
@@ -180,7 +181,7 @@ test("preparation ignores project node_modules executables in caller PATH", asyn
         prepare: [
           "/usr/bin/bash",
           "-c",
-          'set -e; umask 077; jq --version >/dev/null 2>&1; printf \'{"version":1,"resources":[]}\\n\' > "$PI_SESH_PREPARE_DIR/handoff.json"',
+          'set -e; umask 077; ls --version >/dev/null 2>&1; printf \'{"version":1,"resources":[]}\\n\' > "$PI_SESH_PREPARE_DIR/handoff.json"',
         ],
       },
       "pi-path-test",

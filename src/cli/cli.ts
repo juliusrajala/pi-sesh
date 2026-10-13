@@ -10,6 +10,7 @@ import {
   type WorkspaceMode,
 } from "../config/config";
 import { buildProjectImage } from "../container/podman";
+import { buildDefaultImage } from "../container/default-image";
 import { defaultStateRoot } from "../workspace/workspace";
 import { stagedResourcePath } from "../handoff/handoff";
 import {
@@ -91,6 +92,7 @@ const versionPlugin: CrustPlugin = {
 
 export interface CliDependencies {
   buildImage?: typeof buildProjectImage;
+  buildDefaultImage?: typeof buildDefaultImage;
   startSession?: typeof startSession;
   executeSession?: typeof executeSession;
   attachSession?: typeof attachSession;
@@ -342,6 +344,22 @@ export function createCli(dependencies: CliDependencies = {}) {
           );
         }),
     )
+    .command("build-default", (command) =>
+      command
+        .meta({ description: "Build the shared default image with Git" })
+        .flags({
+          pull: {
+            type: "boolean",
+            description: "Pull a missing public base image",
+          },
+        })
+        .run(async ({ flags }) => {
+          const result = await (
+            dependencies.buildDefaultImage ?? buildDefaultImage
+          )({ pullMissingBases: flags.pull });
+          console.log(`Built ${result.tag} (${result.imageId})`);
+        }),
+    )
     .command("build", (command) =>
       command
         .meta({ description: "Build the configured project image" })
@@ -485,10 +503,6 @@ export function createCli(dependencies: CliDependencies = {}) {
             choices: ["none", "pasta"],
             description: "Container network (default: none)",
           },
-          handoff: {
-            type: "string",
-            description: "Explicit versioned resource handoff manifest",
-          },
         })
         .args([{ name: "project", type: "string", required: true }])
         .run(async ({ args, flags }) => {
@@ -513,7 +527,6 @@ export function createCli(dependencies: CliDependencies = {}) {
             spec,
             detached: true,
             tty: false,
-            handoffManifestPath: flags.handoff,
           });
           const { record, status } = await (
             dependencies.getSessionStatus ?? getSessionStatus
@@ -732,17 +745,10 @@ export function createCli(dependencies: CliDependencies = {}) {
     .command("stop", (command) =>
       command
         .meta({ description: "Stop a running session" })
-        .flags({
-          "session-id": {
-            type: "string",
-            description: "Require the immutable session ID",
-          },
-        })
         .args([{ name: "name", type: "string", required: true }])
-        .run(async ({ args, flags }) => {
+        .run(async ({ args }) => {
           const status = await (dependencies.stopSession ?? stopSession)({
             name: args.name,
-            ...(flags["session-id"] ? { sessionId: flags["session-id"] } : {}),
           });
           console.log(
             `Session ${args.name} ${status.state}${status.exitCode === undefined ? "" : ` exit=${status.exitCode}`}`,
@@ -752,17 +758,10 @@ export function createCli(dependencies: CliDependencies = {}) {
     .command("remove", (command) =>
       command
         .meta({ description: "Remove an exited session and its owned clone" })
-        .flags({
-          "session-id": {
-            type: "string",
-            description: "Require the immutable session ID",
-          },
-        })
         .args([{ name: "name", type: "string", required: true }])
-        .run(async ({ args, flags }) => {
+        .run(async ({ args }) => {
           await (dependencies.removeSession ?? removeSession)({
             name: args.name,
-            ...(flags["session-id"] ? { sessionId: flags["session-id"] } : {}),
           });
           console.log(`Removed session ${args.name}`);
         }),
