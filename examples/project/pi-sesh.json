@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "image": "localhost/pi-sesh-example:dev",
+  "build": { "context": ".", "file": "Containerfile" },
+  "environment": { "NODE_ENV": "development" }
+}

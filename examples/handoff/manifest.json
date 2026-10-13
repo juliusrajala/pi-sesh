@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "resources": [
+    {
+      "id": "settings",
+      "kind": "snapshot",
+      "source": "resources/settings.json",
+      "destination": "/home/session/.config/example-harness/settings.json",
+      "access": "ro",
+      "lifetime": "retained"
+    },
+    {
+      "id": "output",
+      "kind": "owned-directory",
+      "destination": "/home/session/.local/share/example-harness/output",
+      "lifetime": "retained"
+    }
+  ]
+}
