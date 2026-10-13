@@ -1,18 +1,14 @@
 import { Crust, type CrustPlugin } from "@crustjs/core";
 import { helpPlugin, noColorPlugin, renderHelp } from "@crustjs/plugins";
-import { initProject } from "../config/init";
 import packageInfo from "../../package.json";
-import { setupPrompt } from "./setup-prompt";
+import { buildDefaultImage } from "../container/default-image";
+import { buildProjectImage } from "../container/podman";
 import {
   resolveEffectiveSpec,
   validateContainerEnvironment,
   type NetworkMode,
   type WorkspaceMode,
 } from "../config/config";
-import { buildProjectImage } from "../container/podman";
-import { buildDefaultImage } from "../container/default-image";
-import { defaultStateRoot } from "../workspace/workspace";
-import { stagedResourcePath } from "../handoff/handoff";
 import {
   cleanupPresetHandoff,
   generatedSessionName,
@@ -29,8 +25,9 @@ import {
   startSession,
   stopSession,
 } from "../container/session";
-import { bulkSessionAction } from "./session-actions";
-import { outputUsesColor, printSessionList } from "./session-list";
+import { outputUsesColor } from "./session-list";
+import { registerLifecycleCommands } from "./lifecycle-commands";
+import { registerProjectCommands } from "./project-commands";
 
 const version = packageInfo.version;
 
@@ -246,7 +243,7 @@ async function launchUserPreset(
 }
 
 export function createCli(dependencies: CliDependencies = {}) {
-  return new Crust("pi-sesh")
+  const commandTree = new Crust("pi-sesh")
     .meta({
       description: "Rootless containerized command sessions",
       usage: "pi-sesh <command|preset> [options] [-- agent-argv...]",
@@ -291,121 +288,9 @@ export function createCli(dependencies: CliDependencies = {}) {
       }
       if (args.command.length) throw new Error("Pass preset argv after --");
       await launchUserPreset(args.preset, flags, rawArgs, dependencies);
-    })
-    .command("init", (command) =>
-      command
-        .meta({ description: "Create project config; preserve existing files" })
-        .flags({
-          image: { type: "string", description: "Select a development image" },
-          file: {
-            type: "string",
-            description: "Select an existing project recipe",
-          },
-          workspace: {
-            type: "string",
-            choices: ["mount", "clone"],
-            description: "Workspace mode (default: mount)",
-          },
-        })
-        .args([
-          {
-            name: "project",
-            type: "string",
-            description: "Project folder (default: current folder)",
-          },
-        ])
-        .run(async ({ args, flags }) => {
-          const result = await initProject(
-            args.project ?? dependencies.currentDirectory?.() ?? process.cwd(),
-            {
-              image: flags.image,
-              file: flags.file,
-              workspace: flags.workspace as WorkspaceMode | undefined,
-            },
-          );
-          console.log(
-            `${result.created ? "Created" : "Using existing"} ${result.path}`,
-          );
-          if (result.created)
-            console.log(
-              "Mount mode writes to the original project unless you selected clone. Agent settings were not changed.",
-            );
-        }),
-    )
-    .command("setup-prompt", (command) =>
-      command
-        .meta({
-          description:
-            "Print a setup prompt for the current folder; do not change files",
-        })
-        .run(() => {
-          console.log(
-            setupPrompt(dependencies.currentDirectory?.() ?? process.cwd()),
-          );
-        }),
-    )
-    .command("build-default", (command) =>
-      command
-        .meta({ description: "Build the shared default image with Git" })
-        .flags({
-          pull: {
-            type: "boolean",
-            description: "Pull a missing public base image",
-          },
-        })
-        .run(async ({ flags }) => {
-          const result = await (
-            dependencies.buildDefaultImage ?? buildDefaultImage
-          )({ pullMissingBases: flags.pull });
-          console.log(`Built ${result.tag} (${result.imageId})`);
-        }),
-    )
-    .command("build", (command) =>
-      command
-        .meta({ description: "Build the configured project image" })
-        .flags({
-          config: {
-            type: "string",
-            description: "Use an explicit config file",
-          },
-          image: {
-            type: "string",
-            description: "Override the configured image tag",
-          },
-          context: {
-            type: "string",
-            description: "Override the build context",
-          },
-          file: {
-            type: "string",
-            description: "Override the Containerfile path",
-          },
-          pull: {
-            type: "boolean",
-            description: "Pull missing public base images",
-          },
-        })
-        .args([{ name: "project", type: "string", required: true }])
-        .run(async ({ args, flags }) => {
-          const spec = await resolveEffectiveSpec({
-            projectDir: args.project,
-            configFile: flags.config,
-            purpose: "build",
-            overrides: {
-              image: flags.image,
-              context: flags.context,
-              file: flags.file,
-            },
-          });
-          const result = await (dependencies.buildImage ?? buildProjectImage)(
-            spec,
-            {
-              pullMissingBases: flags.pull,
-            },
-          );
-          console.log(`Built ${result.tag} (${result.imageId})`);
-        }),
-    )
+    });
+  const projectTree = registerProjectCommands(commandTree, dependencies);
+  const sessionTree = projectTree
     .command("start", (command) =>
       command
         .meta({ description: "Start an arbitrary command in a named session" })
@@ -623,149 +508,8 @@ export function createCli(dependencies: CliDependencies = {}) {
             throw new Error("Pass preset argv after --");
           await launchUserPreset(args.preset, flags, rawArgs, dependencies);
         }),
-    )
-    .command("clean", (command) =>
-      command
-        .meta({ description: "Remove stopped sessions; preview by default" })
-        .flags({
-          all: {
-            type: "boolean",
-            description: "Include sessions from all projects",
-          },
-          yes: {
-            type: "boolean",
-            description: "Confirm removal, including retained output",
-          },
-        })
-        .args([
-          {
-            name: "project",
-            type: "string",
-            description: "Project folder (default: current folder)",
-          },
-        ])
-        .run(({ args, flags }) =>
-          bulkSessionAction("clean", args.project, flags, dependencies),
-        ),
-    )
-    .command("stop-all", (command) =>
-      command
-        .meta({ description: "Stop running sessions; preview by default" })
-        .flags({
-          all: {
-            type: "boolean",
-            description: "Include sessions from all projects",
-          },
-          yes: {
-            type: "boolean",
-            description: "Confirm stopping; retain session results",
-          },
-        })
-        .args([
-          {
-            name: "project",
-            type: "string",
-            description: "Project folder (default: current folder)",
-          },
-        ])
-        .run(({ args, flags }) =>
-          bulkSessionAction("stop-all", args.project, flags, dependencies),
-        ),
-    )
-    .command("list", (command) =>
-      command.meta({ description: "List pi-sesh sessions" }).run(async () => {
-        const sessions = await (dependencies.listSessions ?? listSessions)({});
-        printSessionList(sessions);
-      }),
-    )
-    .command("inspect", (command) =>
-      command
-        .meta({
-          description:
-            "Inspect a session without loading project configuration",
-        })
-        .args([{ name: "name", type: "string", required: true }])
-        .run(async ({ args }) => {
-          const { record, status } = await (
-            dependencies.getSessionStatus ?? getSessionStatus
-          )({ name: args.name });
-          console.log(
-            JSON.stringify({
-              name: record.name,
-              id: record.id,
-              containerId: record.containerId,
-              imageId: record.imageId,
-              state: status.state,
-              ...(status.exitCode === undefined
-                ? {}
-                : { exitCode: status.exitCode }),
-              projectDir: record.projectDir,
-              workspacePath: record.workspacePath,
-              sourceRevision: record.sourceRevision,
-              workspace: record.workspaceMode,
-              network: record.network,
-              resources: (record.resources ?? []).map((resource) => ({
-                id: resource.id,
-                hostPath: stagedResourcePath(
-                  defaultStateRoot(process.env),
-                  record.id,
-                  resource.id,
-                ),
-                destination: resource.destination,
-                kind: resource.kind,
-                access: resource.access,
-                lifetime: resource.lifetime,
-              })),
-            }),
-          );
-        }),
-    )
-    .command("attach", (command) =>
-      command
-        .meta({ description: "Attach to the same running process" })
-        .args([{ name: "name", type: "string", required: true }])
-        .run(async ({ args }) => {
-          const code = await (dependencies.attachSession ?? attachSession)({
-            name: args.name,
-          });
-          process.exitCode = code;
-        }),
-    )
-    .command("logs", (command) =>
-      command
-        .meta({ description: "Show retained container logs" })
-        .args([{ name: "name", type: "string", required: true }])
-        .run(async ({ args }) => {
-          const result = await (
-            dependencies.showSessionLogs ?? showSessionLogs
-          )({ name: args.name });
-          if (result.status !== 0) process.exitCode = result.status;
-        }),
-    )
-    .command("stop", (command) =>
-      command
-        .meta({ description: "Stop a running session" })
-        .args([{ name: "name", type: "string", required: true }])
-        .run(async ({ args }) => {
-          const status = await (dependencies.stopSession ?? stopSession)({
-            name: args.name,
-          });
-          console.log(
-            `Session ${args.name} ${status.state}${status.exitCode === undefined ? "" : ` exit=${status.exitCode}`}`,
-          );
-        }),
-    )
-    .command("remove", (command) =>
-      command
-        .meta({ description: "Remove an exited session and its owned clone" })
-        .args([{ name: "name", type: "string", required: true }])
-        .run(async ({ args }) => {
-          await (dependencies.removeSession ?? removeSession)({
-            name: args.name,
-          });
-          console.log(`Removed session ${args.name}`);
-        }),
     );
+  return registerLifecycleCommands(sessionTree, dependencies);
 }
 
 export async function runCli(
