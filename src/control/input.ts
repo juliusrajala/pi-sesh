@@ -2,6 +2,8 @@ import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isLiteralArgv } from "../argv";
+import { isHandoffDestination } from "../handoff/handoff";
+import { containerPathsOverlap } from "../path-utils";
 import type { SessionArtifactInput, SessionSecretInput } from "./index";
 
 const MAX_POLL_INTERVAL_MS = 60_000;
@@ -40,15 +42,22 @@ export function validateArtifactInputs(
 ): SessionArtifactInput[] {
   if (!Array.isArray(artifacts) || artifacts.length > 8)
     throw new Error("A session can select at most 8 artifact directories");
+  const ids = new Set<string>();
+  const destinations: string[] = [];
   return artifacts.map((artifact) => {
     if (
       !artifact ||
       typeof artifact.id !== "string" ||
       !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(artifact.id) ||
-      typeof artifact.destination !== "string" ||
-      !artifact.destination.startsWith("/home/session/")
+      ids.has(artifact.id) ||
+      !isHandoffDestination(artifact.destination) ||
+      destinations.some((target) =>
+        containerPathsOverlap(target, artifact.destination),
+      )
     )
       throw new Error("Artifact IDs and destinations are invalid");
+    ids.add(artifact.id);
+    destinations.push(artifact.destination);
     return { id: artifact.id, destination: artifact.destination };
   });
 }
@@ -60,6 +69,7 @@ export function validateSecretInputs(
   if (!Array.isArray(secrets) || secrets.length > 24)
     throw new Error("A session can select at most 24 secret files");
   const ids = new Set(artifacts.map(({ id }) => id));
+  const destinations = artifacts.map(({ destination }) => destination);
   let totalBytes = 0;
   const validated = secrets.map((secret) => {
     if (
@@ -67,13 +77,16 @@ export function validateSecretInputs(
       typeof secret.id !== "string" ||
       !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(secret.id) ||
       ids.has(secret.id) ||
-      typeof secret.destination !== "string" ||
-      !secret.destination.startsWith("/home/session/") ||
+      !isHandoffDestination(secret.destination) ||
+      destinations.some((target) =>
+        containerPathsOverlap(target, secret.destination),
+      ) ||
       (typeof secret.content !== "string" &&
         !(secret.content instanceof Uint8Array))
     )
       throw new Error("Secret file IDs, destinations, or content are invalid");
     ids.add(secret.id);
+    destinations.push(secret.destination);
     const content =
       typeof secret.content === "string"
         ? new TextEncoder().encode(secret.content)

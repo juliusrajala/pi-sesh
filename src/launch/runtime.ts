@@ -2,6 +2,7 @@ import { lstat, readdir, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, posix } from "node:path";
 import { PiSeshError } from "../errors";
+import { containerPathsOverlap } from "../path-utils";
 
 export interface RuntimeMount {
   source: string;
@@ -40,14 +41,7 @@ export function validateRuntimeMounts(value: unknown): RuntimeMount[] {
       fail(
         "Runtime destination must be a canonical path below /home/session/runtime/",
       );
-    if (
-      targets.some(
-        (target) =>
-          target === destination ||
-          target.startsWith(`${destination}/`) ||
-          destination.startsWith(`${target}/`),
-      )
-    )
+    if (targets.some((target) => containerPathsOverlap(target, destination)))
       fail("Runtime destinations must not overlap");
     targets.push(destination);
     return { source, destination };

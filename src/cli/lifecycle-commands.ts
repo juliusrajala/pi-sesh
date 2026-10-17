@@ -1,5 +1,4 @@
-import type { Crust } from "@crustjs/core";
-import type { CliDependencies } from "./cli";
+import type { CliCommandTree, CliDependencies } from "./cli";
 import { defaultStateRoot } from "../workspace/workspace";
 import { stagedResourcePath } from "../handoff/handoff";
 import {
@@ -14,9 +13,9 @@ import { bulkSessionAction } from "./session-actions";
 import { printSessionList } from "./session-list";
 
 export function registerLifecycleCommands(
-  cli: Crust<any, any, any>,
+  cli: CliCommandTree,
   dependencies: CliDependencies,
-): Crust<any, any, any> {
+): CliCommandTree {
   return cli
     .command("clean", (command) =>
       command

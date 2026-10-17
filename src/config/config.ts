@@ -148,6 +148,18 @@ export function validateImageReference(value: unknown): string {
   return value;
 }
 
+export function validateWorkspaceMode(value: unknown): WorkspaceMode {
+  if (value !== "mount" && value !== "clone")
+    fail('workspace must be "mount" or "clone"');
+  return value;
+}
+
+export function validateNetworkMode(value: unknown): NetworkMode {
+  if (value !== "none" && value !== "pasta")
+    fail('network must be "none" or "pasta"');
+  return value;
+}
+
 function validatePath(value: unknown, where: string): string {
   if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
     return fail(`${where} must be a non-empty path string`);
@@ -176,18 +188,12 @@ function validateConfig(value: unknown): ProjectConfig {
 
   let workspace: WorkspaceMode | undefined;
   if (input.workspace !== undefined) {
-    if (input.workspace !== "mount" && input.workspace !== "clone") {
-      fail('workspace must be "mount" or "clone"');
-    }
-    workspace = input.workspace;
+    workspace = validateWorkspaceMode(input.workspace);
   }
 
   let network: NetworkMode | undefined;
   if (input.network !== undefined) {
-    if (input.network !== "none" && input.network !== "pasta") {
-      fail('network must be "none" or "pasta"');
-    }
-    network = input.network;
+    network = validateNetworkMode(input.network);
   }
 
   let environment: Record<string, string> | undefined;
@@ -403,17 +409,19 @@ export async function resolveEffectiveSpec(options: {
     ...(loaded.configFile ? { configFile: loaded.configFile } : {}),
     image,
     ...(build ? { build } : {}),
-    workspace:
+    workspace: validateWorkspaceMode(
       overrides.workspace ??
-      config.workspace ??
-      options.presetDefaults?.workspace ??
-      "mount",
+        config.workspace ??
+        options.presetDefaults?.workspace ??
+        "mount",
+    ),
     ...(command ? { command: [...command] } : {}),
-    network:
+    network: validateNetworkMode(
       overrides.network ??
-      (options.projectDefaultsOnly
-        ? (options.presetDefaults?.network ?? "none")
-        : (config.network ?? "none")),
+        (options.projectDefaultsOnly
+          ? (options.presetDefaults?.network ?? "none")
+          : (config.network ?? "none")),
+    ),
     ...(Object.keys(environment).length > 0 ? { environment } : {}),
   };
 }

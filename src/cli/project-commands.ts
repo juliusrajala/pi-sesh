@@ -1,15 +1,14 @@
-import type { Crust } from "@crustjs/core";
 import { initProject } from "../config/init";
 import { resolveEffectiveSpec, type WorkspaceMode } from "../config/config";
 import { buildProjectImage } from "../container/podman";
 import { buildDefaultImage } from "../container/default-image";
 import { setupPrompt } from "./setup-prompt";
-import type { CliDependencies } from "./cli";
+import type { CliCommandTree, CliDependencies } from "./cli";
 
 export function registerProjectCommands(
-  cli: Crust<any, any, any>,
+  cli: CliCommandTree,
   dependencies: CliDependencies,
-): Crust<any, any, any> {
+): CliCommandTree {
   return cli
     .command("init", (command) =>
       command

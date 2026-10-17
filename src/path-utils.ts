@@ -10,6 +10,15 @@ export function isPathWithin(parent: string, child: string): boolean {
   );
 }
 
+/** Compare canonical container paths without matching sibling name prefixes. */
+export function containerPathsOverlap(left: string, right: string): boolean {
+  return (
+    left === right ||
+    left.startsWith(`${right}/`) ||
+    right.startsWith(`${left}/`)
+  );
+}
+
 export async function ensureOwnedPrivateDirectory(
   path: string,
   message: string,

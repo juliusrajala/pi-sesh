@@ -22,7 +22,11 @@ import {
   sep,
 } from "node:path";
 import { PiSeshError } from "../errors";
-import { ensureOwnedPrivateDirectory, isPathWithin } from "../path-utils";
+import {
+  containerPathsOverlap,
+  ensureOwnedPrivateDirectory,
+  isPathWithin,
+} from "../path-utils";
 
 const MANIFEST_LIMIT = 1024 * 1024;
 const ENTRY_LIMIT = 32;
@@ -109,21 +113,23 @@ function currentUid(): number {
   return value;
 }
 
-function validateDestination(value: unknown): string {
-  if (
-    typeof value !== "string" ||
-    !value.startsWith("/home/session/") ||
-    value === "/home/session/" ||
-    value.includes("\\") ||
-    value.includes("\0") ||
-    posix.normalize(value) !== value ||
-    value
+export function isHandoffDestination(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.startsWith("/home/session/") &&
+    value !== "/home/session/" &&
+    !/[\\\\\0\r\n:,]/.test(value) &&
+    posix.normalize(value) === value &&
+    !value
       .split("/")
       .slice(1)
       .some((part) => part === "" || part === "." || part === "..")
-  ) {
+  );
+}
+
+function validateDestination(value: unknown): string {
+  if (!isHandoffDestination(value))
     fail("Handoff destination must be a canonical path below /home/session/");
-  }
   return value;
 }
 
@@ -162,14 +168,7 @@ function validateManifestValue(value: unknown): HandoffManifest {
       fail("Handoff resource IDs must be unique simple names");
     ids.add(item.id);
     const destination = validateDestination(item.destination);
-    if (
-      targets.some(
-        (target) =>
-          target === destination ||
-          target.startsWith(`${destination}/`) ||
-          destination.startsWith(`${target}/`),
-      )
-    )
+    if (targets.some((target) => containerPathsOverlap(target, destination)))
       fail("Handoff destinations must not duplicate or overlap");
     targets.push(destination);
 

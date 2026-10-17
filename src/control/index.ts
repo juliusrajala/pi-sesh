@@ -16,6 +16,8 @@ import {
 import { PiSeshError } from "../errors";
 export { PiSeshError } from "../errors";
 import { defaultStateRoot } from "../workspace/workspace";
+import { openPresetSession } from "../launch/session";
+export { PresetSessionError } from "../launch/session";
 import {
   createHandoffManifest,
   validateArtifactInputs,
@@ -90,6 +92,21 @@ export interface StartSessionInput {
   artifacts?: SessionArtifactInput[];
 }
 
+export interface OpenPresetInput {
+  preset: string;
+  name: string;
+  projectDir: string;
+  image?: string;
+  workspace?: PiSeshWorkspaceMode;
+  network?: PiSeshNetwork;
+  signal?: AbortSignal;
+}
+
+export interface PresetSession extends PiSeshSession {
+  /** Resolved preset argv. Append workload arguments when calling exec. */
+  command: string[];
+}
+
 export interface SessionArtifact {
   id: string;
   destination: string;
@@ -155,6 +172,7 @@ export interface PiSeshControl {
   };
   sessions: {
     start(input: StartSessionInput): Promise<PiSeshSession>;
+    openPreset(input: OpenPresetInput): Promise<PresetSession>;
     list(): Promise<PiSeshSession[]>;
     inspect(id: string): Promise<PiSeshSession>;
     wait(
@@ -218,6 +236,19 @@ export function createPiSesh(
       },
     },
     sessions: {
+      async openPreset(input) {
+        const { record, status, command } = await openPresetSession({
+          preset: input.preset,
+          name: input.name,
+          projectDir: input.projectDir,
+          image: input.image,
+          workspace: input.workspace,
+          network: input.network,
+          signal: input.signal,
+          stateRoot,
+        });
+        return { ...toPublicSession({ record, status }, stateRoot), command };
+      },
       async start(input) {
         if (!input.name || !input.workspace?.path)
           throw new Error("Session name and workspace path are required");

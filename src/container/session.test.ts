@@ -105,6 +105,7 @@ function fakePodman(
     foreignLabel?: boolean;
     existsStatus?: number;
     inspectMalformed?: boolean;
+    onInspect?: () => void;
     removeNoop?: boolean;
     execWaitForAbort?: boolean;
     execStatus?: number;
@@ -112,6 +113,7 @@ function fakePodman(
     failStop?: boolean;
     startWaitForAbort?: boolean;
     startError?: boolean;
+    createError?: boolean;
   } = {},
 ) {
   const calls: Array<{ args: string[]; env: Record<string, string> }> = [];
@@ -149,6 +151,7 @@ function fakePodman(
         args
           .find((value) => value.startsWith("io.pi-sesh.session-id="))
           ?.split("=")[1] ?? "";
+      if (options.createError) throw new Error("create response lost");
       return result(0, `${containerId}\n`);
     }
     if (args[0] === "container" && args[1] === "start") {
@@ -176,6 +179,7 @@ function fakePodman(
     if (args[0] === "container" && args[1] === "exists")
       return result(options.existsStatus ?? (exists ? 0 : 1));
     if (args[0] === "container" && args[1] === "inspect") {
+      options.onInspect?.();
       if (options.inspectMalformed) return result(0, '{"Id":"invalid"}');
       return result(
         0,
@@ -510,6 +514,127 @@ test("exec refuses foreign containers and invalid requests before execution", as
     }),
   ).rejects.toThrow("NUL");
   expect(fake.calls.some((call) => call.args[0] === "exec")).toBe(false);
+});
+
+test("detached cancellation during startup inspection verifies removal before cleanup", async () => {
+  for (const failRemoveOnce of [false, true]) {
+    const { project, stateRoot } = await fixture();
+    const controller = new AbortController();
+    const fake = fakePodman({
+      onInspect: () => controller.abort(),
+      failRemoveOnce,
+    });
+    const client = await fake.client(stateRoot);
+    await expect(
+      startSession({
+        name: "cancelled-open",
+        spec: spec(project),
+        detached: true,
+        signal: controller.signal,
+        client,
+        stateRoot,
+      }),
+    ).rejects.toThrow();
+    const removal = fake.calls.findIndex(
+      ({ args }) => args[0] === "container" && args[1] === "rm",
+    );
+    expect(removal).toBeGreaterThan(0);
+    expect(fake.calls[removal + 1]!.args.slice(0, 2)).toEqual([
+      "container",
+      "exists",
+    ]);
+    expect(await readdir(join(stateRoot, "sessions"))).toHaveLength(
+      failRemoveOnce ? 1 : 0,
+    );
+    expect(await readdir(join(stateRoot, "names"))).toHaveLength(
+      failRemoveOnce ? 1 : 0,
+    );
+  }
+});
+
+test("lost create responses preserve resources until owned-container absence is verified", async () => {
+  for (const scenario of [
+    {},
+    { failRemoveOnce: true },
+    { foreignLabel: true },
+    { existsStatus: 2 },
+  ]) {
+    const { project, stateRoot } = await fixture();
+    const handoffPath = join(project, "handoff.json");
+    await writeFile(
+      handoffPath,
+      JSON.stringify({
+        version: 1,
+        resources: [
+          {
+            id: "output",
+            kind: "owned-directory",
+            destination: "/home/session/output",
+            lifetime: "retained",
+          },
+        ],
+      }),
+    );
+    const fake = fakePodman({ ...scenario, createError: true });
+    const client = await fake.client(stateRoot);
+    await expect(
+      startSession({
+        name: "lost-create",
+        spec: spec(project),
+        detached: true,
+        handoffManifestPath: handoffPath,
+        client,
+        stateRoot,
+      }),
+    ).rejects.toThrow("create response lost");
+    const records = await readdir(join(stateRoot, "sessions"));
+    if (Object.keys(scenario).length === 0) {
+      expect(records).toHaveLength(0);
+      expect(await readdir(join(stateRoot, "names"))).toHaveLength(0);
+      await expect(readdir(join(stateRoot, "resources"))).rejects.toThrow();
+      continue;
+    }
+    expect(records).toHaveLength(1);
+    const record = JSON.parse(
+      await readFile(join(stateRoot, "sessions", records[0]!), "utf8"),
+    );
+    expect(record.resources).toHaveLength(1);
+    expect(
+      (
+        await stat(join(stateRoot, "resources", record.id, "output", "payload"))
+      ).isDirectory(),
+    ).toBe(true);
+    if (scenario.foreignLabel || scenario.existsStatus) {
+      expect(
+        fake.calls.some(
+          ({ args }) => args[0] === "container" && args[1] === "rm",
+        ),
+      ).toBe(false);
+    }
+    fake.options.foreignLabel = false;
+    fake.options.existsStatus = undefined;
+    const recovered = await getSessionStatus({
+      name: "lost-create",
+      client,
+      stateRoot,
+    });
+    expect(recovered.record.containerId).toBe(containerId);
+    await removeSession({ name: "lost-create", client, stateRoot });
+    expect(await readdir(join(stateRoot, "sessions"))).toHaveLength(0);
+  }
+});
+
+test("session policy rejects unsafe runtime modes before Podman access", async () => {
+  const { project } = await fixture();
+  for (const overrides of [
+    { network: "host" as "none" },
+    { workspace: "unsafe" as "mount" },
+    { command: ["tool", "bad\0arg"] },
+  ]) {
+    await expect(
+      startSession({ name: "invalid", spec: spec(project, overrides) }),
+    ).rejects.toThrow();
+  }
 });
 
 test("runtime create args apply the fixed security/resource policy and preserve argv", async () => {

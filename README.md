@@ -376,6 +376,8 @@ SIGINT or SIGTERM sent to an attached `launch` stops and verifies the container.
 
 `remove` verifies that the owned container is absent before it deletes a clone, resource, or session record. Engine errors and ownership mismatches block cleanup. Do not bypass these checks by deleting state directories manually.
 
+If Podman loses the container-create response, pi-sesh checks the generated container name and its ownership labels before cleanup. It retains resources and the name reservation when it cannot verify container absence. Use `inspect`, `stop`, and `remove` for recovery after the engine is available again.
+
 ### Cleanup shortcuts
 
 Preview cleanup for the current project:
@@ -427,6 +429,8 @@ pi-sesh remove tools
 Use the immutable `id` from `open` or `inspect`, not the container ID. `open` starts a detached environment with clone mode and no network by default. Its image needs `/bin/sh` and `sleep`. `exec` runs argv in that environment and forwards command streams. Use `--cwd` to change its container working directory.
 
 An `exec` cancellation, timeout, or transport failure stops the whole container, including other commands in it. Use `--timeout <seconds>` for an execution deadline. Private execution records store identity, time, and outcome, not argv or output.
+
+For local Bun integrations, `sessions.openPreset()` opens this kind of environment with an existing user preset's resources and runtime mounts. It returns the preset command for later execution. This lets the caller prepare the workspace before the agent starts without duplicating preset setup. See [Programmatic use](docs/programmatic-usage.md#open-an-existing-preset-before-running-its-agent).
 
 ## Container limits and security
 

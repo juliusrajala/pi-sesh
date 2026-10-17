@@ -9,13 +9,13 @@ import {
   type NetworkMode,
   type WorkspaceMode,
 } from "../config/config";
+import { generatedSessionName } from "../launch/preset";
 import {
-  cleanupPresetHandoff,
-  generatedSessionName,
-  loadLaunchPreset,
-  preparePresetHandoff,
-} from "../launch/preset";
+  startPresetSession,
+  type PresetSessionDependencies,
+} from "../launch/session";
 import {
+  OPEN_ENVIRONMENT_COMMAND,
   attachSession,
   executeSession,
   getSessionStatus,
@@ -87,10 +87,9 @@ const versionPlugin: CrustPlugin = {
   },
 };
 
-export interface CliDependencies {
+export interface CliDependencies extends PresetSessionDependencies {
   buildImage?: typeof buildProjectImage;
   buildDefaultImage?: typeof buildDefaultImage;
-  startSession?: typeof startSession;
   executeSession?: typeof executeSession;
   attachSession?: typeof attachSession;
   getSessionStatus?: typeof getSessionStatus;
@@ -98,9 +97,6 @@ export interface CliDependencies {
   removeSession?: typeof removeSession;
   showSessionLogs?: typeof showSessionLogs;
   stopSession?: typeof stopSession;
-  loadLaunchPreset?: typeof loadLaunchPreset;
-  preparePresetHandoff?: typeof preparePresetHandoff;
-  cleanupPresetHandoff?: typeof cleanupPresetHandoff;
   currentDirectory?: () => string;
 }
 
@@ -163,65 +159,35 @@ async function launchUserPreset(
   rawArgs: string[],
   dependencies: CliDependencies,
 ): Promise<void> {
-  const preset = await (dependencies.loadLaunchPreset ?? loadLaunchPreset)(
-    presetName,
-  );
   const sessionName = flags.name ?? generatedSessionName();
   const projectDir = dependencies.currentDirectory?.() ?? process.cwd();
   const environment = parseEnvironmentFlags(flags.env);
-  const spec = await resolveEffectiveSpec({
-    projectDir,
-    configFile: flags.config,
-    purpose: "start",
-    projectDefaultsOnly: true,
-    presetDefaults: {
-      image: preset.image,
-      workspace: preset.workspace,
-      network: preset.network,
-      ...(preset.environment ? { environment: preset.environment } : {}),
-    },
-    overrides: {
-      image: flags.image,
-      workspace: flags.workspace as WorkspaceMode | undefined,
-      network: flags.network as NetworkMode | undefined,
-      command: [...preset.command, ...rawArgs],
-      ...(Object.keys(environment).length > 0 ? { environment } : {}),
-    },
-  });
-  if (
-    preset.prepare &&
-    preset.image &&
-    !flags.image &&
-    spec.image !== preset.image
-  ) {
-    throw new Error(
-      "A project cannot select an image for a preset with host preparation; use --image to confirm the image explicitly",
-    );
-  }
-  let prepared: Awaited<ReturnType<typeof preparePresetHandoff>>;
   const controller = new AbortController();
   const abort = () => controller.abort();
   process.on("SIGINT", abort);
   process.on("SIGTERM", abort);
   try {
-    prepared = await (
-      dependencies.preparePresetHandoff ?? preparePresetHandoff
-    )(preset, sessionName, controller.signal);
     console.error(`Launching preset ${presetName} as session ${sessionName}`);
-    const result = await (dependencies.startSession ?? startSession)({
-      name: sessionName,
-      spec,
-      detached: flags.detach,
-      tty:
-        flags.tty ??
-        (!flags.detach && Boolean(process.stdin.isTTY && process.stdout.isTTY)),
-      signal: controller.signal,
-      runtimeMounts: [
-        ...(preset.runtime ?? []),
-        ...(prepared?.runtimeMounts ?? []),
-      ],
-      ...(prepared ? { handoffManifestPath: prepared.manifestPath } : {}),
-    });
+    const { session: result } = await startPresetSession(
+      {
+        preset: presetName,
+        projectDir,
+        name: sessionName,
+        configFile: flags.config,
+        image: flags.image,
+        workspace: flags.workspace as WorkspaceMode | undefined,
+        network: flags.network as NetworkMode | undefined,
+        ...(Object.keys(environment).length > 0 ? { environment } : {}),
+        args: rawArgs,
+        detached: flags.detach,
+        tty:
+          flags.tty ??
+          (!flags.detach &&
+            Boolean(process.stdin.isTTY && process.stdout.isTTY)),
+        signal: controller.signal,
+      },
+      dependencies,
+    );
     console.error(
       `Preset ${presetName} session ${result.name} (${result.id}) ${result.state}${result.exitCode === undefined ? "" : ` exit=${result.exitCode}`}`,
     );
@@ -229,21 +195,13 @@ async function launchUserPreset(
   } finally {
     process.off("SIGINT", abort);
     process.off("SIGTERM", abort);
-    try {
-      await (dependencies.cleanupPresetHandoff ?? cleanupPresetHandoff)(
-        prepared,
-      );
-    } catch {
-      console.error(
-        `Unable to remove private preset preparation data at ${prepared?.directory ?? "the temporary directory"} for session ${sessionName}`,
-      );
-      process.exitCode = 1;
-    }
   }
 }
 
-export function createCli(dependencies: CliDependencies = {}) {
-  const commandTree = new Crust("pi-sesh")
+export type CliCommandTree = ReturnType<typeof createRootCli>;
+
+function createRootCli(dependencies: CliDependencies) {
+  return new Crust("pi-sesh")
     .meta({
       description: "Rootless containerized command sessions",
       usage: "pi-sesh <command|preset> [options] [-- agent-argv...]",
@@ -289,7 +247,13 @@ export function createCli(dependencies: CliDependencies = {}) {
       if (args.command.length) throw new Error("Pass preset argv after --");
       await launchUserPreset(args.preset, flags, rawArgs, dependencies);
     });
-  const projectTree = registerProjectCommands(commandTree, dependencies);
+}
+
+export function createCli(dependencies: CliDependencies = {}) {
+  const projectTree = registerProjectCommands(
+    createRootCli(dependencies),
+    dependencies,
+  );
   const sessionTree = projectTree
     .command("start", (command) =>
       command
@@ -400,11 +364,7 @@ export function createCli(dependencies: CliDependencies = {}) {
               image: flags.image,
               workspace: (flags.workspace ?? "clone") as WorkspaceMode,
               network: (flags.network ?? "none") as NetworkMode,
-              command: [
-                "/bin/sh",
-                "-c",
-                "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done",
-              ],
+              command: [...OPEN_ENVIRONMENT_COMMAND],
             },
           });
           const started = await (dependencies.startSession ?? startSession)({

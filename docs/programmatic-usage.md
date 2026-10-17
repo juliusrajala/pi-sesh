@@ -56,6 +56,38 @@ Use `images.build` with explicit project, context, recipe, and tag to build a wo
 
 This API currently targets Bun on Linux. Its public contract can change until pi-sesh defines a versioned SDK policy. Keep the CLI for stable scripts and external consumers.
 
+### Open an existing preset before running its agent
+
+Use `sessions.openPreset` when the caller must prepare the workspace before the agent starts. It uses the same preset resolution and trusted preparation as the CLI launcher. It starts a detached environment, not the preset command. The image needs `/bin/sh` and `sleep`.
+
+```ts
+const session = await piSesh.sessions.openPreset({
+  preset: "pi",
+  name: `worker-${jobId}`,
+  projectDir,
+  workspace: "clone",
+  image: "localhost/project:dev",
+  signal,
+});
+
+try {
+  // Prepare the clone before the agent reads project context.
+  await piSesh.sessions.exec(session.id, ["git", "status", "--short"]);
+  const result = await piSesh.sessions.exec(session.id, [
+    ...session.command, "--model", "openai-codex/gpt-6-luna", "--print", prompt,
+  ], { signal });
+  console.log(result.stdout);
+} finally {
+  await piSesh.sessions.stop(session.id);
+}
+// Read retained artifacts before removing the session.
+await piSesh.sessions.remove(session.id);
+```
+
+The returned session includes `command`, the resolved preset argv. Append agent arguments when calling `exec`. Resources and runtime mounts come from the selected preset. Do not recreate them in the caller. `workspace`, `image`, and `network` are optional overrides. Omitted values follow the CLI preset precedence. No new preset or agent installation is required. `signal` cancels preparation and startup; use the existing `exec`, `wait`, `stop`, and `remove` methods after opening.
+
+A readiness or post-start preparation-cleanup failure throws `PresetSessionError`, exported from `pi-sesh/control`. Its optional `session` field contains the started session's identity. Inspect `error.session.id` before recovery; its saved state is not a current status check. These failures do not automatically delete the session or its retained results. If startup and preparation cleanup both fail, the error's `cause` is an `AggregateError` with both failures. Invalid network modes, workspace modes, names, and command arguments fail before host preparation.
+
 ## Build and locate the executable
 
 From this repository, build the Linux x86-64 executable with Bun 1.3.14:

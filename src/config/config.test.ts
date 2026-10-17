@@ -50,6 +50,23 @@ test("resolves config defaults and canonical build paths", async () => {
   expect(spec.network).toBe("none");
 });
 
+test("effective specs reject runtime mode overrides from untyped callers", async () => {
+  const { project } = await fixture();
+  for (const overrides of [
+    { network: "host" as "none", command: ["tool"] },
+    { workspace: "unsafe" as "mount", command: ["tool"] },
+  ]) {
+    await expect(
+      resolveEffectiveSpec({
+        projectDir: project,
+        purpose: "start",
+        projectDefaultsOnly: true,
+        overrides,
+      }),
+    ).rejects.toThrow("must be");
+  }
+});
+
 test("CLI values override file values and command argv replaces config command", async () => {
   const { project } = await fixture();
   await writeConfig(project, {
