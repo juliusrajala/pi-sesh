@@ -10,30 +10,30 @@ import {
 } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import {
-  DEFAULT_IMAGE,
   validateContainerEnvironment,
   validateNetworkMode,
   validateWorkspaceMode,
   type EffectiveSpec,
 } from "../config/config";
 import { PiSeshError } from "../errors";
-import { isLiteralArgv } from "../argv";
 import {
-  handoffMountArgs,
   removeStagedResource,
-  stageHandoffManifest,
-  type StagedResource,
   type StagedResourceRecord,
 } from "../handoff/handoff";
 import { PodmanClient, type CommandResult } from "./podman";
+import { ensureOwnedPrivateDirectory } from "../path-utils";
 import {
-  containerPathsOverlap,
-  ensureOwnedPrivateDirectory,
-} from "../path-utils";
-import { runtimeMountArgs, type RuntimeMount } from "../launch/runtime";
+  startSessionWithServices,
+  type StartSessionOptions,
+} from "./session-start";
+import {
+  inspectOwnedContainer,
+  isStoppedOrMissing,
+  OWNER_LABEL,
+  SESSION_LABEL,
+} from "./owned-container";
 import {
   defaultStateRoot,
-  prepareWorkspace,
   removeOwnedClone,
   type WorkspaceResult,
 } from "../workspace/workspace";
@@ -47,18 +47,6 @@ export const OPEN_ENVIRONMENT_COMMAND = Object.freeze([
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
-const OWNER_LABEL = "io.pi-sesh.owner";
-const SESSION_LABEL = "io.pi-sesh.session-id";
-const PENDING_CONTAINER_ID = "0".repeat(64);
-
-function summarizeEngineDiagnostic(stderr: string): string | undefined {
-  const message = stderr
-    .replace(/[\u0000-\u001f\u007f]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (!message) return undefined;
-  return message.length > 512 ? `${message.slice(0, 509)}...` : message;
-}
 
 export interface SessionRecord {
   version: 1;
@@ -313,27 +301,6 @@ async function recordByName(
   return record;
 }
 
-type ContainerInspect = Record<string, unknown>;
-
-function objectValue(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
-
-function parseContainerInspect(output: string): ContainerInspect {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(output);
-  } catch (cause) {
-    fail("Podman returned invalid container inspection data", cause);
-  }
-  const item = Array.isArray(parsed) ? parsed[0] : parsed;
-  const result = objectValue(item);
-  if (!result) fail("Podman returned empty container inspection data");
-  return result;
-}
-
 export function buildContainerCreateArgs(options: {
   record: Pick<SessionRecord, "id" | "name" | "containerName" | "imageId">;
   spec: EffectiveSpec;
@@ -436,85 +403,13 @@ export function buildContainerCreateArgs(options: {
   return args;
 }
 
-async function inspectContainer(
+async function reconcileContainerIdentity(
   client: PodmanClient,
   record: SessionRecord,
-): Promise<{ status: ContainerStatus; selinux: boolean }> {
-  const pending = record.containerId === PENDING_CONTAINER_ID;
-  const target = pending ? record.containerName : record.containerId;
-  const exists = await client.invoke(["container", "exists", target]);
-  if (exists.status === 1)
-    return { status: { state: "missing" }, selinux: false };
-  if (exists.status !== 0)
-    fail(
-      `Podman could not determine whether container ${target} exists (exit ${exists.status})`,
-    );
-  const result = await client.checked([
-    "container",
-    "inspect",
-    "--format",
-    "json",
-    target,
-  ]);
-  const item = parseContainerInspect(result.stdout);
-  const stateInfo = objectValue(item.State);
-  const config = objectValue(item.Config);
-  const labels = objectValue(config?.Labels ?? item.Labels);
-  if (
-    typeof item.Id !== "string" ||
-    !/^[0-9a-f]{64}$/i.test(item.Id) ||
-    !stateInfo ||
-    typeof stateInfo.Status !== "string" ||
-    typeof stateInfo.ExitCode !== "number" ||
-    !Number.isInteger(stateInfo.ExitCode)
-  ) {
-    fail("Podman returned incomplete container inspection data");
-  }
-  if (!labels) fail("Podman returned invalid container labels");
-  if (
-    (!pending && item.Id !== record.containerId) ||
-    labels[OWNER_LABEL] !== "pi-sesh" ||
-    labels[SESSION_LABEL] !== record.id
-  ) {
-    fail(
-      "Refusing to operate on a container not owned by this pi-sesh session",
-    );
-  }
-  // Recover a lost create response only after the ownership labels match.
-  if (pending) record.containerId = item.Id;
-  const rawState = stateInfo.Status.toLowerCase();
-  const states: Record<string, ContainerStatus["state"]> = {
-    running: "running",
-    exited: "exited",
-    stopped: "stopped",
-    created: "created",
-    configured: "created",
-    paused: "paused",
-  };
-  const state = states[rawState];
-  if (!state)
-    fail(`Unsupported Podman container state: ${rawState || "unknown"}`);
-  const exitCode = stateInfo.ExitCode;
-  return {
-    status:
-      state === "running" || state === "created" || state === "paused"
-        ? { state }
-        : { state, exitCode },
-    selinux: (() => {
-      const hostConfig = objectValue(item.HostConfig);
-      const securityOpt = hostConfig?.SecurityOpt;
-      return (
-        Array.isArray(securityOpt) &&
-        securityOpt.some(
-          (value) => typeof value === "string" && value.includes("label"),
-        )
-      );
-    })(),
-  };
-}
-
-function isStoppedOrMissing(state: ContainerStatus["state"]): boolean {
-  return state === "exited" || state === "stopped" || state === "missing";
+): Promise<{ status: ContainerStatus }> {
+  const inspected = await inspectOwnedContainer(client, record);
+  if (inspected.kind === "owned") record.containerId = inspected.containerId;
+  return { status: inspected.status };
 }
 
 async function cleanHandoffResources(
@@ -562,7 +457,7 @@ async function inspectAndCleanSession(
   stateRoot: string,
   record: SessionRecord,
 ): Promise<{ record: SessionRecord; status: ContainerStatus }> {
-  const inspected = await inspectContainer(client, record);
+  const inspected = await reconcileContainerIdentity(client, record);
   if (isStoppedOrMissing(inspected.status.state))
     await cleanSessionSecrets(stateRoot, record);
   return { record, status: inspected.status };
@@ -576,332 +471,19 @@ async function removeSessionRecord(
   await releaseName(stateRoot, record.name, record.id);
 }
 
-export async function startSession(options: {
-  name: string;
-  spec: EffectiveSpec;
-  detached?: boolean;
-  tty?: boolean;
-  signal?: AbortSignal;
-  runtimeMounts?: RuntimeMount[];
-  client?: PodmanClient;
-  stateRoot?: string;
-  handoffManifestPath?: string;
-  prepareHandoff?: (context: {
-    sessionId: string;
-    stateRoot: string;
-    env: NodeJS.ProcessEnv;
-  }) => Promise<{ manifestPath: string; cleanup: () => Promise<void> }>;
-}): Promise<StartedSession> {
-  validateSessionName(options.name);
-  validateNetworkMode(options.spec.network);
-  validateWorkspaceMode(options.spec.workspace);
-  options.signal?.throwIfAborted();
-  if (!isLiteralArgv(options.spec.command))
-    fail("A non-empty literal command argv is required");
-  const runtimeArgs = await runtimeMountArgs(options.runtimeMounts ?? []);
-  if (options.handoffManifestPath && options.prepareHandoff)
-    fail(
-      "Use either an explicit handoff manifest or a trusted handoff preparer, not both",
-    );
-  const client =
-    options.client ??
-    (await PodmanClient.create({ projectDir: options.spec.projectDir }));
-  const host = await client.preflight(options.spec.network);
-  if (!(await client.imageExists(options.spec.image))) {
-    const remedy =
-      options.spec.image === DEFAULT_IMAGE
-        ? 'run "pi-sesh build-default" (use --pull if the base image is missing)'
-        : "build or select an image";
-    fail(
-      `Image ${options.spec.image} is not present locally; ${remedy} before starting`,
-    );
-  }
-  const imageId = await client.imageId(options.spec.image);
-  const stateRoot = await prepareStateRoot(client, options.stateRoot);
-  const id = randomUUID();
-  const containerName = `pi-sesh-${id}`;
-  await reserveName(stateRoot, options.name, id);
-
-  let workspace: WorkspaceResult | undefined;
-  let handoffSetup:
-    | { manifestPath: string; cleanup: () => Promise<void> }
-    | undefined;
-  let handoff: StagedResource[] = [];
-  let containerCreateAttempted = false;
-  let retainAfterStartFailure = false;
-  let record: SessionRecord | undefined;
-  try {
-    workspace = await prepareWorkspace({
-      projectDir: options.spec.projectDir,
-      mode: options.spec.workspace,
-      sessionId: id,
-      stateRoot,
-    });
-    if (options.prepareHandoff)
-      handoffSetup = await options.prepareHandoff({
-        sessionId: id,
-        stateRoot,
-        env: client.env,
-      });
-    record = {
-      version: 1,
-      id,
-      name: options.name,
-      containerName,
-      containerId: PENDING_CONTAINER_ID,
-      projectDir: workspace.projectDir,
-      workspaceMode: workspace.mode,
-      workspacePath: workspace.path,
-      ...(workspace.sourceRevision
-        ? { sourceRevision: workspace.sourceRevision }
-        : {}),
-      imageId,
-      network: options.spec.network,
-      tty: options.tty ?? !options.detached,
-      createdAt: new Date().toISOString(),
-      resources: [],
-    };
-    const manifestPath =
-      options.handoffManifestPath ?? handoffSetup?.manifestPath;
-    if (manifestPath) {
-      handoff = await stageHandoffManifest({
-        manifestPath,
-        stateRoot,
-        sessionId: id,
-        register: async (resource) => {
-          record!.resources!.push(resource);
-          await writeRecord(stateRoot, record!);
-        },
-      });
-    }
-    for (const resource of handoff) {
-      for (const mount of options.runtimeMounts ?? []) {
-        const target = resource.record.destination;
-        if (containerPathsOverlap(target, mount.destination))
-          fail("Runtime and handoff destinations must not overlap");
-      }
-    }
-    if (handoffSetup) {
-      await handoffSetup.cleanup();
-      handoffSetup = undefined;
-    }
-    const uid = process.getuid?.();
-    const gid = process.getgid?.();
-    if (uid === undefined || gid === undefined)
-      fail("Linux invoking UID/GID is unavailable");
-    const createArgs = buildContainerCreateArgs({
-      record,
-      spec: options.spec,
-      workspace,
-      uid,
-      gid,
-      tty: record.tty,
-      interactive: !options.detached,
-      runtimeMounts: runtimeArgs,
-      selinux: host.selinuxEnabled,
-      handoffMounts: handoffMountArgs({
-        resources: handoff,
-        selinux: host.selinuxEnabled,
-      }),
-      terminal: { term: client.env.TERM, colorTerm: client.env.COLORTERM },
-    });
-    // Podman host SELinux state is part of preflight information; the client resolves it for this create.
-    options.signal?.throwIfAborted();
-    await writeRecord(stateRoot, record);
-    containerCreateAttempted = true;
-    const createResult = await client.checked(createArgs);
-    const containerId = createResult.stdout.trim().toLowerCase();
-    if (!/^[0-9a-f]{64}$/.test(containerId))
-      fail("Podman returned an invalid container ID");
-    record.containerId = containerId;
-    await writeRecord(stateRoot, record);
-
-    const detached = options.detached ?? false;
-    const startArgs = detached
-      ? ["container", "start", record.containerId]
-      : [
-          "container",
-          "start",
-          "--attach",
-          "--interactive",
-          "--detach-keys",
-          "ctrl-p,ctrl-q",
-          record.containerId,
-        ];
-    let startResult: CommandResult;
-    try {
-      options.signal?.throwIfAborted();
-      startResult = await client.invoke(startArgs, {
-        stdio: detached ? "pipe" : "inherit",
-        ...(detached ? {} : { signal: options.signal }),
-      });
-      if (options.signal?.aborted) throw new Error("Launch cancelled");
-    } catch (error) {
-      if (!detached) {
-        const before = await inspectContainer(client, record);
-        if (before.status.state === "running")
-          await client.checked([
-            "container",
-            "stop",
-            "--time",
-            "0",
-            record.containerId,
-          ]);
-        const after = await inspectContainer(client, record);
-        if (
-          !isStoppedOrMissing(after.status.state) &&
-          after.status.state !== "created"
-        )
-          fail(
-            "Cannot verify launch cancellation; refusing to delete resources before verified container removal",
-          );
-        if (isStoppedOrMissing(after.status.state)) {
-          retainAfterStartFailure = true;
-          await cleanSessionSecrets(stateRoot, record);
-        }
-      }
-      throw error;
-    }
-    const current = await inspectContainer(client, record);
-    if (current.status.state === "missing")
-      fail("Podman container disappeared during startup");
-    if (
-      !detached &&
-      startResult.status !== 0 &&
-      current.status.state === "running"
-    ) {
-      await client.checked([
-        "container",
-        "stop",
-        "--time",
-        "0",
-        record.containerId,
-      ]);
-      const after = await inspectContainer(client, record);
-      if (!isStoppedOrMissing(after.status.state))
-        fail("Cannot verify stop after an attached transport failure");
-      retainAfterStartFailure = true;
-      await cleanSessionSecrets(stateRoot, record);
-      fail(`Podman attached transport failed (exit ${startResult.status})`);
-    }
-    if (
-      startResult.status !== 0 &&
-      (detached ||
-        current.status.state === "running" ||
-        current.status.state === "created")
-    ) {
-      const diagnostic = summarizeEngineDiagnostic(startResult.stderr);
-      fail(
-        `Podman failed to start the session (exit ${startResult.status})${diagnostic ? `: ${diagnostic}` : ""}`,
-      );
-    }
-    if (isStoppedOrMissing(current.status.state))
-      await cleanSessionSecrets(stateRoot, record);
-    if (detached) options.signal?.throwIfAborted();
-    return {
-      id,
-      name: options.name,
-      containerId,
-      state: current.status.state,
-      ...(current.status.exitCode === undefined
-        ? {}
-        : { exitCode: current.status.exitCode }),
-      detached,
-    };
-  } catch (error) {
-    if (retainAfterStartFailure)
-      fail(
-        `Launch interrupted; stopped session ${options.name} and its results remain available`,
-        error,
-      );
-    await rollbackFailedStart({
-      error,
-      client,
-      containerCreateAttempted,
-      record,
-      handoffSetup,
-      stateRoot,
-      workspace,
-      sessionId: id,
-      name: options.name,
-    });
-    await rm(sessionPath(stateRoot, id), { force: true }).catch(() => {});
-    await releaseName(stateRoot, options.name, id).catch(() => {});
-    if (error instanceof PiSeshError) throw error;
-    fail(
-      `Unable to start session: ${error instanceof Error ? error.message : String(error)}`,
-      error,
-    );
-  }
-}
-
-async function rollbackFailedStart(options: {
-  error: unknown;
-  client: PodmanClient;
-  containerCreateAttempted: boolean;
-  record?: SessionRecord;
-  handoffSetup?: { cleanup: () => Promise<void> };
-  stateRoot: string;
-  workspace?: WorkspaceResult;
-  sessionId: string;
-  name: string;
-}): Promise<void> {
-  let cleanupProblem: unknown;
-  if (options.containerCreateAttempted) {
-    try {
-      if (!options.record) fail("Container creation has no recovery metadata");
-      const before = await inspectContainer(options.client, options.record);
-      if (before.status.state !== "missing")
-        await options.client.invoke([
-          "container",
-          "rm",
-          "--force",
-          options.record.containerId,
-        ]);
-      const after = await inspectContainer(options.client, options.record);
-      if (after.status.state !== "missing")
-        fail("Container removal could not be verified");
-    } catch (cause) {
-      cleanupProblem = cause;
-    }
-  }
-  const mayCleanResources =
-    !options.containerCreateAttempted || !cleanupProblem;
-  if (options.handoffSetup) {
-    try {
-      await options.handoffSetup.cleanup();
-    } catch (cause) {
-      cleanupProblem ??= cause;
-    }
-  }
-  if (mayCleanResources && options.record?.resources?.length) {
-    try {
-      await cleanHandoffResources(options.stateRoot, options.record, "all");
-    } catch (cause) {
-      cleanupProblem ??= cause;
-    }
-  }
-  if (mayCleanResources && options.workspace?.mode === "clone") {
-    try {
-      await removeOwnedClone({
-        stateRoot: options.stateRoot,
-        sessionId: options.sessionId,
-        expectedWorkspacePath: options.workspace.path,
-        containerAbsent: true,
-      });
-    } catch (cause) {
-      cleanupProblem ??= cause;
-    }
-  }
-  if (cleanupProblem) {
-    if (options.record)
-      await writeRecord(options.stateRoot, options.record).catch(() => {});
-    throw new PiSeshError(
-      "SESSION",
-      `Startup failed (${options.error instanceof Error ? options.error.message : String(options.error)}) and owned resources could not be fully cleaned (${cleanupProblem instanceof Error ? cleanupProblem.message : String(cleanupProblem)}); session ${options.name} remains reserved for recovery`,
-      { cause: options.error },
-    );
-  }
+export async function startSession(
+  options: StartSessionOptions,
+): Promise<StartedSession> {
+  return startSessionWithServices(options, {
+    validateName: validateSessionName,
+    prepareStateRoot,
+    reserveName,
+    releaseName,
+    writeRecord,
+    deleteRecord: (root, id) => rm(sessionPath(root, id), { force: true }),
+    cleanResources: cleanHandoffResources,
+    buildCreateArgs: buildContainerCreateArgs,
+  });
 }
 
 async function findStateRoot(options: {
@@ -1006,7 +588,7 @@ export async function executeSession(options: {
   const record = await recordByName(stateRoot, options.name);
   if (record.id !== options.sessionId)
     fail("Session ID does not match the named session");
-  const before = await inspectContainer(client, record);
+  const before = await reconcileContainerIdentity(client, record);
   if (before.status.state !== "running")
     fail(
       `Session ${record.name} is ${before.status.state}; execution requires a running container`,
@@ -1036,7 +618,7 @@ export async function executeSession(options: {
     if (controller.signal.aborted) return;
     controller.abort();
     cancellation = (async () => {
-      const current = await inspectContainer(client, record);
+      const current = await reconcileContainerIdentity(client, record);
       if (current.status.state === "running")
         await client.checked([
           "container",
@@ -1045,7 +627,7 @@ export async function executeSession(options: {
           "0",
           record.containerId,
         ]);
-      const after = await inspectContainer(client, record);
+      const after = await reconcileContainerIdentity(client, record);
       if (!isStoppedOrMissing(after.status.state))
         fail(
           "Unable to verify cancellation; the session container may still be live",
@@ -1130,7 +712,7 @@ export async function attachSession(options: {
 }): Promise<number> {
   const { stateRoot, client } = await findStateRoot(options);
   const record = await recordByName(stateRoot, options.name);
-  const before = await inspectContainer(client, record);
+  const before = await reconcileContainerIdentity(client, record);
   if (isStoppedOrMissing(before.status.state)) {
     await cleanSessionSecrets(stateRoot, record);
     fail(
@@ -1147,7 +729,7 @@ export async function attachSession(options: {
     ],
     { stdio: "inherit" },
   );
-  const after = await inspectContainer(client, record);
+  const after = await reconcileContainerIdentity(client, record);
   if (isStoppedOrMissing(after.status.state))
     await cleanSessionSecrets(stateRoot, record);
   return result.status;
@@ -1159,7 +741,7 @@ async function readLogsForRecord(
   record: SessionRecord,
   stdio: "inherit" | "pipe",
 ): Promise<CommandResult> {
-  const inspected = await inspectContainer(client, record);
+  const inspected = await reconcileContainerIdentity(client, record);
   if (inspected.status.state === "missing")
     fail(`Container for session ${record.name} is missing`);
   const result = await client.invoke(
@@ -1201,7 +783,7 @@ export async function stopSession(options: {
   const record = await recordByName(stateRoot, options.name);
   if (options.sessionId !== undefined && options.sessionId !== record.id)
     fail("Session identity changed; refusing to stop a different session");
-  const before = await inspectContainer(client, record);
+  const before = await reconcileContainerIdentity(client, record);
   if (before.status.state === "missing")
     fail(
       `Container for session ${record.name} is missing; remove the stale session explicitly`,
@@ -1219,7 +801,7 @@ export async function stopSession(options: {
       record.containerId,
     ]);
   }
-  const after = await inspectContainer(client, record);
+  const after = await reconcileContainerIdentity(client, record);
   if (!isStoppedOrMissing(after.status.state))
     fail("Podman stop returned but the workload is still live or not stopped");
   await cleanSessionSecrets(stateRoot, record);
@@ -1236,16 +818,16 @@ export async function removeSession(options: {
   const record = await recordByName(stateRoot, options.name);
   if (options.sessionId !== undefined && options.sessionId !== record.id)
     fail("Session identity changed; refusing to remove a different session");
-  const before = await inspectContainer(client, record);
+  const before = await reconcileContainerIdentity(client, record);
   if (before.status.state === "running" || before.status.state === "paused")
     fail("Stop the session before removing it");
   if (before.status.state !== "missing") {
     await client.invoke(["container", "rm", record.containerId]);
-    const after = await inspectContainer(client, record);
+    const after = await reconcileContainerIdentity(client, record);
     if (after.status.state !== "missing")
       fail("Podman removal returned but the owned container is still present");
   }
-  const verified = await inspectContainer(client, record);
+  const verified = await reconcileContainerIdentity(client, record);
   if (verified.status.state !== "missing")
     fail("Refusing to delete session data while its container may still exist");
   await cleanHandoffResources(stateRoot, record, "all");

@@ -378,6 +378,8 @@ SIGINT or SIGTERM sent to an attached `launch` stops and verifies the container.
 
 If Podman loses the container-create response, pi-sesh checks the generated container name and its ownership labels before cleanup. It retains resources and the name reservation when it cannot verify container absence. Use `inspect`, `stop`, and `remove` for recovery after the engine is available again.
 
+Startup recovery reports cleanup and metadata errors with the original startup error. It releases the session name only after resource cleanup and record deletion succeed. If recovery cannot save metadata, the error reports that failure too. See [Session startup and recovery](docs/session-startup.md) for the internal phases and cleanup rules.
+
 ### Cleanup shortcuts
 
 Preview cleanup for the current project:
